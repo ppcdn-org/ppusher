@@ -66,3 +66,14 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ppusher
+/build*/
+/out/
+tests/interop/interop
+tests/interop/interop.exe
+tests/e2e/mockcenter/mockcenter
+tests/e2e/mockcenter/mockcenter.exe
+
+# Go test modules
+!go.mod

@@ -1,0 +1,44 @@
+# Minimal ppmmx for local end-to-end tests with ppusher (no ppcenter registration).
+#   WHIP_AUTH_KEY=<same value as mockcenter -key>  mmx -config mmx-local.yml
+logLevel: debug
+logDestinations: [stdout]
+# ppmmx refuses to start unmanaged; point it at a closed local port instead of a ppcenter. It keeps
+# retrying the registration in the background, which is harmless for this test.
+mmxControl: true
+mmxControlURL: ws://127.0.0.1:18000/ws/mmx
+mmxNodeRole: NODE_ROLE_STANDALONE
+mmxNodeRegion: local
+mmxNodeCapacity: 100
+mmxHeartbeatInterval: 10s
+mmxWebRTCBaseURL: http://127.0.0.1:8888
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpReadBufferSize: 2097152
+
+api: true
+apiAddress: 127.0.0.1:9996
+
+rtsp: false
+rtmp: false
+hls: false
+moq: false
+
+srt: true
+srtAddress: 127.0.0.1:7890
+srtPublishTokenRequired: true
+srtLatency: 300ms
+
+webrtc: true
+webrtcAddress: 127.0.0.1:8888
+webrtcLocalUDPAddress: 127.0.0.1:8188
+webrtcAllowOrigins: ["*"]
+
+# unified publish degrade protocol: TARGET_STATE / LOSS_SAMPLE over /<path>/ws/whip
+degradeEnable: true
+degradeSampleSec: 2
+
+paths:
+  all:
+    source: publisher

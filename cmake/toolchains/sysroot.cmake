@@ -1,0 +1,11 @@
+# shared tail of the toolchain files: point CMake and pkg-config at the target sysroot only
+if(PPUSHER_SYSROOT)
+  set(CMAKE_SYSROOT ${PPUSHER_SYSROOT})
+  set(CMAKE_FIND_ROOT_PATH ${PPUSHER_SYSROOT})
+  set(ENV{PKG_CONFIG_SYSROOT_DIR} ${PPUSHER_SYSROOT})
+  set(ENV{PKG_CONFIG_LIBDIR} ${PPUSHER_SYSROOT}/usr/lib/pkgconfig:${PPUSHER_SYSROOT}/usr/lib/${_triple}/pkgconfig:${PPUSHER_SYSROOT}/usr/share/pkgconfig)
+endif()
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
