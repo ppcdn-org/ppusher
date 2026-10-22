@@ -17,9 +17,9 @@ struct tsd {
 	size_t carry_n;
 	int pmt_pid;
 	int have_pmt;
-	int vpid, vtype, apid, atype, achan, arate;
+	int vpid[4], nv, vtype, apid, atype, achan, arate;
 	int audio_ready; /* AAC: ADTS header seen */
-	pes_acc v, a;
+	pes_acc v[4], a;
 };
 
 static const int aac_rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
@@ -36,7 +36,9 @@ void tsd_destroy(tsd *d)
 {
 	if (!d)
 		return;
-	free(d->v.buf);
+	int i;
+	for (i = 0; i < 4; i++)
+		free(d->v[i].buf);
 	free(d->a.buf);
 	free(d);
 }
@@ -46,6 +48,7 @@ int tsd_ready(const tsd *d)
 	return d->have_pmt && (d->atype == TSD_AUDIO_NONE || d->atype == TSD_AUDIO_OPUS || d->audio_ready);
 }
 int tsd_video_codec(const tsd *d) { return d->vtype; }
+int tsd_video_layers(const tsd *d) { return d->nv; }
 int tsd_audio_codec(const tsd *d) { return d->atype; }
 int tsd_audio_channels(const tsd *d) { return d->achan; }
 int tsd_audio_rate(const tsd *d) { return d->arate; }
@@ -146,7 +149,7 @@ static void deliver_audio(tsd *d, const uint8_t *pes, size_t n)
 	}
 }
 
-static void deliver_video(tsd *d, const uint8_t *pes, size_t n)
+static void deliver_video(tsd *d, int layer, const uint8_t *pes, size_t n)
 {
 	size_t hl;
 	int64_t pts, dts;
@@ -161,14 +164,14 @@ static void deliver_video(tsd *d, const uint8_t *pes, size_t n)
 		return;
 	pts = rd_ts(pes + 9);
 	dts = (flags == 3 && n >= 19) ? rd_ts(pes + 14) : pts;
-	d->cb.on_video(pes + hl, n - hl, pts, dts, d->cb.ud);
+	d->cb.on_video(layer, pes + hl, n - hl, pts, dts, d->cb.ud);
 }
 
-static void acc_deliver(tsd *d, pes_acc *a, int is_video)
+static void acc_deliver(tsd *d, pes_acc *a, int video_layer)
 {
 	if (a->n) {
-		if (is_video)
-			deliver_video(d, a->buf, a->n);
+		if (video_layer >= 0)
+			deliver_video(d, video_layer, a->buf, a->n);
 		else
 			deliver_audio(d, a->buf, a->n);
 	}
@@ -205,19 +208,19 @@ static void parse_pmt(tsd *d, const uint8_t *s, size_t n)
 	pil = ((s[10] & 0x0F) << 8) | s[11];
 	pos = 12 + pil;
 	end = sl - 4;
-	d->vpid = d->apid = 0;
+	memset(d->vpid, 0, sizeof d->vpid);
+	d->nv = 0;
+	d->apid = 0;
 	d->vtype = d->atype = 0;
 	while (pos + 5 <= end) {
 		int st = s[pos], pid = ((s[pos + 1] & 0x1F) << 8) | s[pos + 2];
 		size_t il = ((s[pos + 3] & 0x0F) << 8) | s[pos + 4], q = pos + 5, qe = pos + 5 + il;
 		if (qe > end)
 			break;
-		if (st == 0x1B && !d->vpid) {
-			d->vpid = pid;
-			d->vtype = TSD_VIDEO_H264;
-		} else if (st == 0x24 && !d->vpid) {
-			d->vpid = pid;
-			d->vtype = TSD_VIDEO_HEVC;
+		if ((st == 0x1B || st == 0x24) && d->nv < 4 &&
+		    (d->vtype == 0 || d->vtype == (st == 0x1B ? TSD_VIDEO_H264 : TSD_VIDEO_HEVC))) {
+			d->vpid[d->nv++] = pid; /* simulcast layers: every video stream of the first codec, in PMT order */
+			d->vtype = st == 0x1B ? TSD_VIDEO_H264 : TSD_VIDEO_HEVC;
 		} else if (st == 0x0F && !d->apid) {
 			d->apid = pid;
 			d->atype = TSD_AUDIO_AAC;
@@ -245,7 +248,7 @@ static void parse_pmt(tsd *d, const uint8_t *s, size_t n)
 		}
 		pos = qe;
 	}
-	d->have_pmt = d->vpid != 0;
+	d->have_pmt = d->nv > 0;
 }
 
 static void on_packet(tsd *d, const uint8_t *p)
@@ -289,12 +292,19 @@ static void on_packet(tsd *d, const uint8_t *p)
 	if (!d->have_pmt)
 		return;
 	{
-		pes_acc *a = pid == d->vpid ? &d->v : pid == d->apid ? &d->a : NULL;
-		int is_video = a == &d->v;
+		pes_acc *a = NULL;
+		int layer = -1, i;
+		for (i = 0; i < d->nv; i++)
+			if (pid == d->vpid[i]) {
+				a = &d->v[i];
+				layer = i;
+			}
+		if (!a && pid == d->apid)
+			a = &d->a;
 		if (!a)
 			return;
 		if (pusi) {
-			acc_deliver(d, a, is_video);
+			acc_deliver(d, a, layer);
 			a->active = 1;
 			if (pn >= 6 && pl[0] == 0 && pl[1] == 0 && pl[2] == 1) {
 				size_t plen = ((size_t)pl[4] << 8) | pl[5];
@@ -306,7 +316,7 @@ static void on_packet(tsd *d, const uint8_t *p)
 		acc_add(a, pl, pn);
 		if (a->want && a->n >= a->want) {
 			a->n = a->want;
-			acc_deliver(d, a, is_video);
+			acc_deliver(d, a, layer);
 		}
 	}
 }
@@ -353,6 +363,8 @@ void tsd_feed(tsd *d, const uint8_t *data, size_t n)
 
 void tsd_flush(tsd *d)
 {
-	acc_deliver(d, &d->v, 1);
-	acc_deliver(d, &d->a, 0);
+	int i;
+	for (i = 0; i < d->nv; i++)
+		acc_deliver(d, &d->v[i], i);
+	acc_deliver(d, &d->a, -1);
 }

@@ -138,6 +138,33 @@ static volatile int g_fetches;
 static volatile int g_drop_conn;    /* ask the SRT listener to hang up on the current connection */
 static volatile long g_srt_bytes[8];
 static volatile int g_bad_alignment;
+static volatile int g_pmt_n[8], g_pmt_pid[8][4], g_pmt_pcr[8];
+static volatile int64_t g_conn_ms[8];
+
+/* find the PMT in the first SRT message of a connection and record its video ES PIDs (in PMT order) */
+static void capture_pmt(int idx, const uint8_t *m, int len)
+{
+	int i;
+	for (i = 0; i + 188 <= len; i += 188) {
+		const uint8_t *p = m + i;
+		int pid = ((p[1] & 0x1F) << 8) | p[2];
+		if (pid == 0x1000 && (p[1] & 0x40)) {
+			const uint8_t *sec = p + 5;
+			int sl = 3 + (((sec[1] & 0x0F) << 8) | sec[2]);
+			int pos = 12 + (((sec[10] & 0x0F) << 8) | sec[11]), end = sl - 4, n = 0;
+			g_pmt_pcr[idx] = ((sec[8] & 0x1F) << 8) | sec[9];
+			while (pos + 5 <= end) {
+				int st = sec[pos], es = ((sec[pos + 1] & 0x1F) << 8) | sec[pos + 2];
+				int il = ((sec[pos + 3] & 0x0F) << 8) | sec[pos + 4];
+				if ((st == 0x1B || st == 0x24) && n < 4)
+					g_pmt_pid[idx][n++] = es;
+				pos += 5 + il;
+			}
+			g_pmt_n[idx] = n;
+			return;
+		}
+	}
+}
 static volatile int g_first_pat_ok;
 static char g_ws_bearers[8][64];
 
@@ -186,7 +213,7 @@ static void ws_send(sock_t c, const char *p)
 	send_all(c, p, n);
 }
 
-typedef enum { WS_BITRATE_THEN_RECONNECT, WS_STEADY, WS_LOSS_STORM } ws_mode;
+typedef enum { WS_BITRATE_THEN_RECONNECT, WS_STEADY, WS_LOSS_STORM, WS_LAYERS } ws_mode;
 static volatile ws_mode g_ws_mode;
 
 static void h_ws(mock_t *m, sock_t c, int nth)
@@ -216,6 +243,19 @@ static void h_ws(mock_t *m, sock_t c, int nth)
 		ws_send(c, "{\"type\":\"TARGET_STATE\",\"path\":\"app1/B01/h264\",\"codec\":\"h264\",\"layers\":1,\"bitrate_percent\":60,\"latency_ms\":800}");
 		pp_sleep_ms(300);
 		ws_send(c, "{\"type\":\"TARGET_STATE\",\"path\":\"app1/B01/h264\",\"codec\":\"h264\",\"layers\":1,\"bitrate_percent\":60,\"latency_ms\":800,\"reconnect\":true,\"reason\":\"degrade-latency-raise\"}");
+	} else if (g_ws_mode == WS_LAYERS) {
+		/* ppmmx's degrade FSM cuts the top layer, later wants it back */
+		if (nth == 1) {
+			ws_send(c, "{\"type\":\"TARGET_STATE\",\"codec\":\"h264\",\"layers\":3,\"bitrate_percent\":60,\"latency_ms\":300}");
+			pp_sleep_ms(600);
+			ws_send(c, "{\"type\":\"TARGET_STATE\",\"codec\":\"h264\",\"layers\":2,\"bitrate_percent\":60,\"latency_ms\":300}");
+		} else if (nth == 2) {
+			ws_send(c, "{\"type\":\"TARGET_STATE\",\"codec\":\"h264\",\"layers\":2,\"bitrate_percent\":60,\"latency_ms\":300}");
+			pp_sleep_ms(500);
+			ws_send(c, "{\"type\":\"TARGET_STATE\",\"codec\":\"h264\",\"layers\":3,\"bitrate_percent\":60,\"latency_ms\":300}");
+		} else {
+			ws_send(c, "{\"type\":\"TARGET_STATE\",\"codec\":\"h264\",\"layers\":3,\"bitrate_percent\":60,\"latency_ms\":300}");
+		}
 	} else if (g_ws_mode == WS_LOSS_STORM) {
 		/* 5% unrecoverable, every 400 ms: over the 1.5% threshold once a full window has elapsed */
 		for (i = 0; i < 40 && !m->stop; i++) {
@@ -273,6 +313,8 @@ static void *srt_listener(void *a)
 			snprintf(g_tokens_seen[idx], sizeof g_tokens_seen[idx], "%.*s", sidlen, sid);
 			g_srt_latency[idx] = lat;
 		}
+		if (idx < 8)
+			g_conn_ms[idx] = pp_now_ms();
 		g_srt_conns = idx + 1;
 		srt_setsockflag(acc, SRTO_RCVTIMEO, &rcvto, sizeof rcvto);
 		for (;;) {
@@ -292,7 +334,9 @@ static void *srt_listener(void *a)
 				g_srt_bytes[idx] += r;
 			if (r % 188 != 0 || buf[0] != 0x47 || (r > 188 && buf[188] != 0x47))
 				g_bad_alignment = 1;
-			if (idx == 0 && g_srt_bytes[0] == r) /* the very first message of a connection */
+			if (idx < 8 && g_srt_bytes[idx] == r) /* the very first message of a connection */
+				capture_pmt(idx, buf, r);
+			if (idx == 0 && g_srt_bytes[0] == r)
 				g_first_pat_ok = (buf[1] & 0x5F) == 0x40 && buf[2] == 0x00 && r == 1316;
 		}
 		srt_close(acc);
@@ -337,7 +381,25 @@ static void srt_listener_stop(void)
 static volatile int g_bitrate_calls, g_last_kbps, g_kf_calls, g_state;
 static volatile int g_saw_fatal;
 
-static void cb_bitrate(int kbps, void *ud) { (void)ud; g_bitrate_calls++; g_last_kbps = kbps; }
+static volatile int g_kbps_layer[4];
+static volatile int g_on_layers_calls, g_on_layers_first[8], g_on_layers_count[8];
+static void cb_bitrate(int layer, int kbps, void *ud)
+{
+	(void)ud;
+	g_bitrate_calls++;
+	g_last_kbps = kbps;
+	if (layer >= 0 && layer < 4)
+		g_kbps_layer[layer] = kbps;
+}
+static void cb_on_layers(int first, int count, void *ud)
+{
+	int i = g_on_layers_calls++;
+	(void)ud;
+	if (i < 8) {
+		g_on_layers_first[i] = first;
+		g_on_layers_count[i] = count;
+	}
+}
 static void cb_keyframe(void *ud) { (void)ud; g_kf_calls++; }
 static void cb_state(int st, const char *info, void *ud)
 {
@@ -397,7 +459,7 @@ static void feed(ppusher_t *p, int ms, int64_t *clock_us)
 	memset(op, 7, sizeof op);
 	while (pp_now_ms() < end) {
 		size_t len = make_au(au, n % 15 == 0, n);
-		ppusher_push_video(p, au, len, *clock_us, *clock_us, n % 15 == 0);
+		ppusher_push_video(p, 0, au, len, *clock_us, *clock_us, n % 15 == 0);
 		for (i = 0; i < 2; i++)
 			ppusher_push_audio(p, op, sizeof op, *clock_us + i * 16000);
 		*clock_us += 33333;
@@ -421,7 +483,7 @@ static ppusher_t *make(mock_t *center, ppusher_callbacks_t *cb, int degrade)
 	cfg.video_codec = PPUSHER_CODEC_H264;
 	cfg.audio_codec = PPUSHER_AUDIO_OPUS;
 	cfg.audio_channels = 2;
-	cfg.video_bitrate_kbps = 2400;
+	cfg.video_bitrate_kbps[0] = 2400;
 	cfg.enable_degrade = degrade;
 	cfg.backoff_min_ms = 200;
 	cfg.backoff_max_ms = 800;
@@ -442,6 +504,12 @@ static void reset_state(void)
 	memset(g_ws_bearers, 0, sizeof g_ws_bearers);
 	g_srt_conns = g_fetches = g_bitrate_calls = g_last_kbps = g_kf_calls = g_state = g_saw_fatal = 0;
 	g_bad_alignment = g_first_pat_ok = g_drop_conn = 0;
+	memset((void *)g_pmt_n, 0, sizeof g_pmt_n);
+	memset((void *)g_pmt_pid, 0, sizeof g_pmt_pid);
+	memset((void *)g_pmt_pcr, 0, sizeof g_pmt_pcr);
+	memset((void *)g_conn_ms, 0, sizeof g_conn_ms);
+	memset((void *)g_kbps_layer, 0, sizeof g_kbps_layer);
+	g_on_layers_calls = 0;
 }
 
 /* ------------------------------------------------------------ scenarios */
@@ -525,7 +593,7 @@ static void test_auth_failure_is_fatal(void)
 	pp_sleep_ms(1200); /* longer than any backoff: it must not retry */
 	CHECK_INT(g_fetches, 1);
 	CHECK_INT(g_srt_conns, 0);
-	CHECK_INT(ppusher_push_video(p, (const uint8_t *)"\0\0\0\1\x65", 5, 0, 0, 1), PPUSHER_E_NOT_CONNECTED);
+	CHECK_INT(ppusher_push_video(p, 0, (const uint8_t *)"\0\0\0\1\x65", 5, 0, 0, 1), PPUSHER_E_NOT_CONNECTED);
 	ppusher_destroy(p);
 	mock_stop(&center);
 	srt_listener_stop();
@@ -579,7 +647,7 @@ static void test_loss_samples_trigger_reconnect(void)
 	cfg.app_id = "app1";
 	cfg.app_secret = "sekret";
 	cfg.stream_name = "B01";
-	cfg.video_bitrate_kbps = 2400;
+	cfg.video_bitrate_kbps[0] = 2400;
 	cfg.backoff_min_ms = 200;
 	cfg.backoff_max_ms = 800;
 	cfg.loss_period_sec = 1;
@@ -603,6 +671,166 @@ static void test_loss_samples_trigger_reconnect(void)
 	mock_stop(&center);
 	mock_stop(&ws);
 	srt_listener_stop();
+}
+
+
+/* push `nl` layers per frame (layer 0 = highest); returns how many layer-0 pushes were refused as LAYER_OFF */
+static int feed_layers(ppusher_t *p, int nl, int ms, int64_t *clock_us)
+{
+	uint8_t au[4096], op[80];
+	int64_t end = pp_now_ms() + ms;
+	int n = 0, l, off = 0;
+	memset(op, 7, sizeof op);
+	while (pp_now_ms() < end) {
+		for (l = 0; l < nl; l++) {
+			size_t len = make_au(au, n % 15 == 0, n + l);
+			int rc = ppusher_push_video(p, l, au, len, *clock_us, *clock_us, n % 15 == 0);
+			if (l == 0 && rc == PPUSHER_E_LAYER_OFF)
+				off++;
+		}
+		ppusher_push_audio(p, op, sizeof op, *clock_us);
+		*clock_us += 33333;
+		n++;
+		pp_sleep_ms(33);
+	}
+	return off;
+}
+
+static void test_simulcast_ladder_and_degrade(void)
+{
+	mock_t center, ws;
+	ppusher_callbacks_t cb;
+	ppusher_config_t cfg;
+	ppusher_t *p;
+	ppusher_stats_t st;
+	char url[64];
+	int64_t clk = 20000000;
+	int off;
+
+	reset_state();
+	g_ws_mode = WS_LAYERS;
+	CHECK_INT(srt_listener_start(), 0);
+	mock_start(&ws, h_ws);
+	g_ws_port = ws.port;
+	mock_start(&center, h_ppcenter);
+	snprintf(url, sizeof url, "http://127.0.0.1:%d", center.port);
+	ppusher_config_default(&cfg);
+	cfg.ppcenter_url = url;
+	cfg.app_id = "app1";
+	cfg.app_secret = "sekret";
+	cfg.stream_name = "B01";
+	cfg.video_layers = 3;
+	cfg.video_bitrate_kbps[0] = 3000;
+	cfg.video_bitrate_kbps[1] = 1500;
+	cfg.video_bitrate_kbps[2] = 600;
+	cfg.backoff_min_ms = 200;
+	cfg.backoff_max_ms = 800;
+	memset(&cb, 0, sizeof cb);
+	cb.set_bitrate = cb_bitrate;
+	cb.on_layers = cb_on_layers;
+	cb.request_keyframe = cb_keyframe;
+	cb.on_state = cb_state;
+	cb.on_log = cb_log;
+	p = ppusher_create(&cfg, &cb);
+	CHECK(p != NULL);
+	CHECK_INT(ppusher_start(p), PPUSHER_OK);
+
+	/* connection 1: the full ladder, three video ES in the PMT, layer 0 first, PCR on layer 0 */
+	CHECK(wait_for(&g_srt_conns, 1, 4000));
+	feed_layers(p, 3, 400, &clk);
+	CHECK_INT(g_pmt_n[0], 3);
+	CHECK_INT(g_pmt_pid[0][0], 0x100);
+	CHECK_INT(g_pmt_pid[0][1], 0x101);
+	CHECK_INT(g_pmt_pid[0][2], 0x102);
+	CHECK_INT(g_pmt_pcr[0], 0x100);
+	CHECK(g_on_layers_calls >= 1);
+	CHECK_INT(g_on_layers_first[0], 0);
+	CHECK_INT(g_on_layers_count[0], 3);
+	/* bitrate_percent=60 applies to every active layer, each from its own nominal rate */
+	CHECK_INT(g_kbps_layer[0], 1800);
+	CHECK_INT(g_kbps_layer[1], 900);
+	CHECK_INT(g_kbps_layer[2], 360);
+
+	/* TARGET_STATE layers=2: ppmmx cut the highest layer -> re-handshake with the lowest two (layers 1,2) */
+	CHECK(wait_for(&g_srt_conns, 2, 5000));
+	off = feed_layers(p, 3, 500, &clk);
+	CHECK_INT(g_fetches, 2);
+	CHECK_STR(g_tokens_seen[1], "publish:app1/B01/h264:TOKh264-2"); /* fresh token for the re-handshake too */
+	CHECK_INT(g_pmt_n[1], 2);
+	CHECK_INT(g_pmt_pid[1][0], 0x101);
+	CHECK_INT(g_pmt_pid[1][1], 0x102);
+	CHECK_INT(g_pmt_pcr[1], 0x101);          /* PCR moves to the first remaining layer */
+	CHECK(g_on_layers_calls >= 2);
+	CHECK_INT(g_on_layers_first[1], 1);
+	CHECK_INT(g_on_layers_count[1], 2);
+	CHECK(off > 5);                          /* the cut layer is refused (LAYER_OFF), not buffered */
+	ppusher_get_stats(p, &st);
+	CHECK_INT(st.active_layers, 2);
+
+	/*
+	 * mmx wants the layer back 0.5 s later; the 5 s anti-storm guard holds the second re-handshake back,
+	 * and the request must not be lost: it fires once the guard expires.
+	 */
+	CHECK(wait_for(&g_srt_conns, 3, 12000));
+	feed_layers(p, 3, 400, &clk);
+	CHECK(g_conn_ms[2] - g_conn_ms[1] >= 4000);
+	CHECK_INT(g_pmt_n[2], 3);
+	CHECK_INT(g_pmt_pid[2][0], 0x100);
+	CHECK_INT(g_on_layers_first[2], 0);
+	CHECK_INT(g_on_layers_count[2], 3);
+	CHECK_STR(g_tokens_seen[2], "publish:app1/B01/h264:TOKh264-3");
+	ppusher_get_stats(p, &st);
+	CHECK_INT(st.active_layers, 3);
+	CHECK_INT(g_bad_alignment, 0);
+
+	ppusher_destroy(p);
+	mock_stop(&center);
+	mock_stop(&ws);
+	srt_listener_stop();
+}
+
+static void test_layer_limits(void)
+{
+	ppusher_config_t cfg;
+	ppusher_callbacks_t cb;
+	ppusher_t *p;
+
+	memset(&cb, 0, sizeof cb);
+	ppusher_config_default(&cfg);
+	cfg.ppcenter_url = "http://127.0.0.1:1";
+	cfg.app_id = "app1";
+	cfg.app_secret = "x";
+	cfg.stream_name = "B01";
+
+	/* ppmmx ValidateVideoTracks: H.264 <= 4, HEVC <= 3 */
+	cfg.video_codec = PPUSHER_CODEC_H264;
+	cfg.video_layers = 4;
+	p = ppusher_create(&cfg, &cb);
+	CHECK(p != NULL);
+	if (p) {
+		ppusher_destroy(p);
+	}
+	cfg.video_layers = 5;
+	CHECK(ppusher_create(&cfg, &cb) == NULL);
+	cfg.video_layers = -1;
+	CHECK(ppusher_create(&cfg, &cb) == NULL);
+
+	cfg.video_codec = PPUSHER_CODEC_HEVC;
+	cfg.video_layers = 3;
+	p = ppusher_create(&cfg, &cb);
+	CHECK(p != NULL);
+	if (p) {
+		/* layer index bounds are checked before anything else */
+		CHECK_INT(ppusher_push_video(p, 3, (const uint8_t *)"abcde", 5, 0, 0, 1), PPUSHER_E_ARG);
+		CHECK_INT(ppusher_push_video(p, -1, (const uint8_t *)"abcde", 5, 0, 0, 1), PPUSHER_E_ARG);
+		ppusher_destroy(p);
+	}
+	cfg.video_layers = 4;
+	CHECK(ppusher_create(&cfg, &cb) == NULL);
+	cfg.video_layers = 0; /* 0 means 1 */
+	p = ppusher_create(&cfg, &cb);
+	CHECK(p != NULL);
+	ppusher_destroy(p);
 }
 
 static void test_api_validation(void)
@@ -634,8 +862,8 @@ static void test_api_validation(void)
 	p = ppusher_create(&cfg, &cb);
 	CHECK(p != NULL);
 	/* never started: frames are rejected, not buffered */
-	CHECK_INT(ppusher_push_video(p, (const uint8_t *)"\0\0\0\1\x65", 5, 0, 0, 1), PPUSHER_E_NOT_CONNECTED);
-	CHECK_INT(ppusher_push_video(p, NULL, 0, 0, 0, 1), PPUSHER_E_ARG);
+	CHECK_INT(ppusher_push_video(p, 0, (const uint8_t *)"\0\0\0\1\x65", 5, 0, 0, 1), PPUSHER_E_NOT_CONNECTED);
+	CHECK_INT(ppusher_push_video(p, 0, NULL, 0, 0, 0, 1), PPUSHER_E_ARG);
 	ppusher_destroy(p);
 }
 
@@ -648,5 +876,7 @@ int main(void)
 	RUN(test_auth_failure_is_fatal);
 	RUN(test_outage_then_recovery);
 	RUN(test_loss_samples_trigger_reconnect);
+	RUN(test_layer_limits);
+	RUN(test_simulcast_ladder_and_degrade);
 	TEST_DONE();
 }

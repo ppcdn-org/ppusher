@@ -18,7 +18,8 @@
 #define TSD_AUDIO_AAC 2
 
 typedef struct {
-	void (*on_video)(const uint8_t *au, size_t len, int64_t pts90, int64_t dts90, void *ud);
+	/* layer = index of the video elementary stream in PMT order (0 = first = highest quality) */
+	void (*on_video)(int layer, const uint8_t *au, size_t len, int64_t pts90, int64_t dts90, void *ud);
 	void (*on_audio)(const uint8_t *frame, size_t len, int64_t pts_us, void *ud);
 	void *ud;
 } tsd_callbacks;
@@ -34,6 +35,7 @@ void tsd_flush(tsd *d);
 /* stream info, valid once tsd_ready() */
 int tsd_ready(const tsd *d);
 int tsd_video_codec(const tsd *d);
+int tsd_video_layers(const tsd *d); /* same-codec video streams in the PMT, max 4 */
 int tsd_audio_codec(const tsd *d);
 int tsd_audio_channels(const tsd *d);
 int tsd_audio_rate(const tsd *d);

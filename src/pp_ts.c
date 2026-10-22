@@ -19,10 +19,11 @@ struct pp_ts {
 	pp_ts_config cfg;
 	uint8_t msg[PP_TS_MSG_SIZE];
 	size_t msg_n; /* bytes used in msg */
-	uint8_t cc_pat, cc_pmt, cc_video, cc_audio;
+	uint8_t cc_pat, cc_pmt, cc_video[PP_MAX_LAYERS], cc_audio;
 	int64_t last_psi;
 	int have_psi;
-	paramset vps, sps, pps;
+	int layers, first; /* ladder size / first active layer */
+	paramset vps[PP_MAX_LAYERS], sps[PP_MAX_LAYERS], pps[PP_MAX_LAYERS];
 	uint8_t *au;
 	size_t au_cap;
 };
@@ -57,10 +58,20 @@ pp_ts *pp_ts_create(const pp_ts_config *cfg)
 		return NULL;
 	if (cfg->audio_codec == PP_AUDIO_OPUS && cfg->audio_channels != 1 && cfg->audio_channels != 2)
 		return NULL;
+	if (cfg->video_layers < 0 || cfg->video_layers > PP_MAX_LAYERS || cfg->first_layer < 0)
+		return NULL;
+	if (cfg->video_layers > 1 && cfg->video_codec == PP_CODEC_HEVC && cfg->video_layers > 3)
+		return NULL;
 	ts = (pp_ts *)calloc(1, sizeof *ts);
 	if (!ts)
 		return NULL;
 	ts->cfg = *cfg;
+	ts->layers = cfg->video_layers ? cfg->video_layers : 1;
+	ts->first = cfg->first_layer;
+	if (ts->first >= ts->layers) {
+		free(ts);
+		return NULL;
+	}
 	return ts;
 }
 
@@ -227,8 +238,9 @@ int pp_ts_write_tables(pp_ts *ts)
 
 	/* PMT */
 	{
-		uint8_t pmt[128];
+		uint8_t pmt[160];
 		size_t es_len_pos, len_pos;
+		int l;
 		n = 0;
 		pmt[n++] = 0x02;
 		len_pos = n;
@@ -239,16 +251,18 @@ int pp_ts_write_tables(pp_ts *ts)
 		pmt[n++] = 0xC1;
 		pmt[n++] = 0x00;
 		pmt[n++] = 0x00;
-		pmt[n++] = (uint8_t)(0xE0 | (PP_PID_VIDEO >> 8)); /* PCR PID = video */
-		pmt[n++] = (uint8_t)(PP_PID_VIDEO & 0xFF);
+		pmt[n++] = (uint8_t)(0xE0 | (PP_PID_VIDEO_LAYER(ts->first) >> 8)); /* PCR PID = first active layer */
+		pmt[n++] = (uint8_t)(PP_PID_VIDEO_LAYER(ts->first) & 0xFF);
 		pmt[n++] = 0xF0;
 		pmt[n++] = 0x00; /* program_info_length */
 
-		pmt[n++] = ts->cfg.video_codec == PP_CODEC_HEVC ? 0x24 : 0x1B;
-		pmt[n++] = (uint8_t)(0xE0 | (PP_PID_VIDEO >> 8));
-		pmt[n++] = (uint8_t)(PP_PID_VIDEO & 0xFF);
-		pmt[n++] = 0xF0;
-		pmt[n++] = 0x00;
+		for (l = ts->first; l < ts->layers; l++) { /* highest -> lowest: ppmmx keeps PMT order as ladder order */
+			pmt[n++] = ts->cfg.video_codec == PP_CODEC_HEVC ? 0x24 : 0x1B;
+			pmt[n++] = (uint8_t)(0xE0 | (PP_PID_VIDEO_LAYER(l) >> 8));
+			pmt[n++] = (uint8_t)(PP_PID_VIDEO_LAYER(l) & 0xFF);
+			pmt[n++] = 0xF0;
+			pmt[n++] = 0x00;
+		}
 
 		if (ts->cfg.audio_codec == PP_AUDIO_OPUS) {
 			pmt[n++] = 0x06; /* private data */
@@ -379,6 +393,12 @@ static size_t build_ts_sei(int codec, int64_t wall_ms, uint8_t *out)
 int pp_ts_write_video(pp_ts *ts, const uint8_t *buf, size_t len, int64_t pts90, int64_t dts90, int is_key,
 		      int64_t wall_ms)
 {
+	return pp_ts_write_video_layer(ts, ts->first, buf, len, pts90, dts90, is_key, wall_ms, 1);
+}
+
+int pp_ts_write_video_layer(pp_ts *ts, int layer, const uint8_t *buf, size_t len, int64_t pts90, int64_t dts90,
+			    int is_key, int64_t wall_ms, int flush_after)
+{
 	int codec = ts->cfg.video_codec;
 	size_t pos = 0, nlen, out = 0, sei_len = 0, sei_at = (size_t)-1;
 	const uint8_t *nal;
@@ -389,23 +409,25 @@ int pp_ts_write_video(pp_ts *ts, const uint8_t *buf, size_t len, int64_t pts90, 
 	src_t src;
 	int64_t pts, dts;
 
+	if (layer < ts->first || layer >= ts->layers)
+		return PP_TS_E_LAYER;
 	if (!buf || len == 0)
 		return -1;
 
-	/* pass 1: learn parameter sets, see what the AU already carries */
+	/* pass 1: learn parameter sets (each layer has its own, they differ in resolution), see what the AU already carries */
 	while (pp_annexb_next(buf, len, &pos, &nal, &nlen)) {
 		int type = pp_nal_type(codec, nal[0]);
 		int kind = pp_nal_kind(codec, type);
 		any = 1;
 		if (kind == PP_NAL_VPS && codec == PP_CODEC_HEVC) {
 			have_vps = 1;
-			cache_ps(&ts->vps, nal, nlen);
+			cache_ps(&ts->vps[layer], nal, nlen);
 		} else if (kind == PP_NAL_SPS) {
 			have_sps = 1;
-			cache_ps(&ts->sps, nal, nlen);
+			cache_ps(&ts->sps[layer], nal, nlen);
 		} else if (kind == PP_NAL_PPS) {
 			have_pps = 1;
-			cache_ps(&ts->pps, nal, nlen);
+			cache_ps(&ts->pps[layer], nal, nlen);
 		}
 	}
 	if (!any)
@@ -427,12 +449,12 @@ int pp_ts_write_video(pp_ts *ts, const uint8_t *buf, size_t len, int64_t pts90, 
 		out += au_nal(ts->au + out, aud, sizeof aud);
 	}
 	if (is_key) {
-		if (codec == PP_CODEC_HEVC && !have_vps && ts->vps.n)
-			out += au_nal(ts->au + out, ts->vps.d, ts->vps.n);
-		if (!have_sps && ts->sps.n)
-			out += au_nal(ts->au + out, ts->sps.d, ts->sps.n);
-		if (!have_pps && ts->pps.n)
-			out += au_nal(ts->au + out, ts->pps.d, ts->pps.n);
+		if (codec == PP_CODEC_HEVC && !have_vps && ts->vps[layer].n)
+			out += au_nal(ts->au + out, ts->vps[layer].d, ts->vps[layer].n);
+		if (!have_sps && ts->sps[layer].n)
+			out += au_nal(ts->au + out, ts->sps[layer].d, ts->sps[layer].n);
+		if (!have_pps && ts->pps[layer].n)
+			out += au_nal(ts->au + out, ts->pps[layer].d, ts->pps[layer].n);
 	}
 	pos = 0;
 	while (pp_annexb_next(buf, len, &pos, &nal, &nlen)) {
@@ -449,7 +471,8 @@ int pp_ts_write_video(pp_ts *ts, const uint8_t *buf, size_t len, int64_t pts90, 
 	if (sei_len && sei_at == (size_t)-1)
 		out += au_nal(ts->au + out, sei, sei_len);
 
-	maybe_psi(ts, pts90, is_key);
+	/* one PAT/PMT per keyframe instant, not one per layer */
+	maybe_psi(ts, pts90, is_key && layer == ts->first);
 
 	pts = pts90 + TS_BASE_OFFSET;
 	dts = dts90 + TS_BASE_OFFSET;
@@ -475,8 +498,11 @@ int pp_ts_write_video(pp_ts *ts, const uint8_t *buf, size_t len, int64_t pts90, 
 	src.b = ts->au;
 	src.bn = out;
 	src.off = 0;
-	packetize(ts, PP_PID_VIDEO, &ts->cc_video, &src, dts - PCR_LEAD, is_key);
-	pp_ts_flush(ts);
+	/* PCR only on the PCR layer (first active); the other layers carry none */
+	packetize(ts, PP_PID_VIDEO_LAYER(layer), &ts->cc_video[layer], &src, layer == ts->first ? dts - PCR_LEAD : -1,
+		  is_key);
+	if (flush_after)
+		pp_ts_flush(ts);
 	return 0;
 }
 

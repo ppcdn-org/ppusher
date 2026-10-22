@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | 已实现（0.1.0），实现与本稿的差异见第 9 节；公共 API 以 `include/ppusher/ppusher.h` 为准 |
+| 状态 | 已实现（0.2.0 起支持 SRT 同播，见第 10 节），实现与本稿的差异见第 9 节；公共 API 以 `include/ppusher/ppusher.h` 为准 |
 | 日期 | 2026-10-22 |
 | 目标 | 面向嵌入式 Linux（ARM/MIPS）盒子的开源 SRT 推流端，对接 PPCDN（ppcenter + ppmmx），仅支持 SRT |
 | 许可证 | MIT（仓库已有 LICENSE） |
@@ -26,7 +26,7 @@
 
 - 不做编码、采集、转码；不支持 RTMP/WHIP/RTSP。
 - 不做同一进程内的 HEVC+H264 双 codec 同播（需要两路编码器，嵌入式盒子通常只有一路）。要同播，起两个 ppusher 实例即可（两个 `/h264`、`/hevc` 路径互相独立，ppmmx 也是这样设计的）。
-- 不做多层 simulcast。`TARGET_STATE.layers` 只做记录和日志，单层编码器天然已在"终止态"。
+- 不做同一连接里的**跨 codec** 混装（ppmmx 要求同一连接单 codec）。单 codec 的多层同播（H.264 ≤ 4、HEVC ≤ 3）从 0.2.0 起支持，见第 10 节。
 - 不做 P2P（ppobs 的 P2P companion 与 SRT 推流是分开的）。
 
 ---
@@ -123,7 +123,7 @@ publish:{appId}/{stream}[/{h264|hevc}]:{token}
 | 参数集 | 关键帧 AU 必须携带 SPS/PPS（HEVC 还有 VPS）。硬件编码器通常已带；没带时库用缓存的参数集补在 IDR 之前（见 §4.3） |
 | PCR | 以视频 PID 为 PCR PID；关键帧和每隔几个 AU 写 PCR（PCR base = DTS − 0.1s，与 mediacommon 一致） |
 | 时间基 | 90kHz；PTS 取单调递增，由调用方提供（微秒）并在库内换算；音视频用同一时钟 |
-| 视频轨数 | 本库只发 1 路视频轨（`ValidateVideoTracks` 要求同 codec，≤4 路 H.264 / ≤3 路 HEVC，我们用不到） |
+| 视频轨数 | 同播：同 codec 的多路视频轨，PMT 顺序 = 层顺序（最高画质在前），H.264 ≤ 4、HEVC ≤ 3（`ValidateVideoTracks`）；超限整条连接被拒绝。单层是它的特例（见第 10 节） |
 | SEI 时间戳（可选） | `OBS-ABSTS-SEI-v1`：`user_data_unregistered` SEI，payload=16 字节 ASCII UUID + 8 字节**大端毫秒** UTC。H.264 插在首个 VCL NAL **之前**（AVC 无 suffix SEI，放后面严格解码器会拒绝）；HEVC 用 suffix SEI（type 40）追加在 AU 末尾。供 EP08 端到端延迟测量，默认关闭 |
 
 ### 2.7 本地丢包快速重连
@@ -411,3 +411,29 @@ ppusher/
 
 - `tests/interop/`：用 ppmmx SRT 摄取同款的 `mediacommon` MPEG-TS 解析器读取复用产物（H.264+Opus、HEVC+AAC+SEI），并断言 path-codec 不一致会被拒绝。
 - `tests/e2e/`：`mockcenter`（模拟 ppcenter 的 `POST /v1/publish/requests`、发布白名单同步与 ppmmx 控制面注册，用一次性密钥签发与生产同格式的 AES-GCM token）+ `run_local_e2e.sh`，对**本地源码构建的真实 ppmmx**做端到端：token 校验、codec path、降级 WS 鉴权与 `CLIENT_INFO`、服务端重启后取新 token 恢复、错误凭据 FATAL。
+
+## 10. SRT 同播（simulcast，0.2.0）
+
+**需求**：同一条 SRT 连接里发多层视频，H.264 最多 4 层、HEVC 最多 3 层（ppmmx `internal/protocols/mpegts/video_tracks.go` 的上限，超限整条连接被拒绝）。
+
+### 10.1 摄取侧事实（读 ppmmx 得到）
+
+- `ValidateVideoTracks`：同连接所有视频轨必须同 codec；H.264 ≤ 4、HEVC ≤ 3（仅当轨数 > 1 时检查上限）。MPEG-TS 不带分辨率，**画质顺序无法校验**，ppmmx 直接把 PMT 里 elementary stream 的顺序当作 highest → lowest（日志 `simulcast layer 0: MPEG-TS elementary stream order 1`）。
+- path 仍是 `appId/stream/{h264|hevc}`，token 仍按精确 path 绑定；同播不增加连接数，也不增加 token。
+- 降级（`publish-degrade-protocol.zh-CN.md` §4、§7.1）：`TARGET_STATE.layers = N` 表示“保留最低的 N 层”（先砍最高分辨率层）；执行端“记录目标层数并重启推流，重启时裁剪”。ppmmx 用 SRT 会话的视频轨数学习 `maxLayers`：新会话 `N > 当前目标` 视为全新/更满的推流（重置为满载），`N <= 目标` 视为降级触发的重连（保留状态机的决定）。
+
+### 10.2 实现
+
+- **复用器**：`pp_ts_config.video_layers / first_layer`。第 L 层的 PID = `0x100 + L`，音频固定 `0x110`（单层时视频仍是 `0x100`）。PMT 只声明 `[first_layer, video_layers)` 的层，按层序排列；**PCR PID = 第一条在线层**。每层独立的连续计数器和 SPS/PPS/VPS 缓存（各层分辨率不同，参数集不同）。PAT/PMT 只在“第一条在线层”的关键帧时刻强制发送，避免每层一份。`pp_ts_write_video_layer(..., flush_after)`：同一帧的各层共享 1316 字节消息，只在最后一层冲刷；用户若以别的顺序推，会话线程 25ms 的陈旧冲刷兜底。
+- **公共 API**：`video_layers`、`video_bitrate_kbps[4]`（每层标称码率）；`ppusher_push_video(p, layer, ...)`；回调 `set_bitrate(layer, kbps)`（对每个在线层按各自标称码率换算 `bitrate_percent`）、`on_layers(first, count)`；被砍的层 `push` 返回 `PPUSHER_E_LAYER_OFF`；统计里有 `active_layers`。`ppusher_create` 在层数超限时返回 NULL，而不是等 ppmmx 在连接建立后把连接踢掉。
+- **砍层/恢复**：WS 线程把 `TARGET_STATE.layers`（夹在 `1..video_layers`）写入 `target_layers`；会话线程每个循环比较 `target_layers` 与在线层数，不一致就产生 `RECONNECT_REQ`，状态机 `CLOSE_AND_FETCH`（取新 token）后按新阶梯重握手。它**不是一次性标志**，而是每步重新判断，所以被 5 秒防抖挡住的请求会在防抖结束后自动重试（`mmx` 在砍层后紧接着又要加回时不会丢）。
+- **关键帧**：每层单独的 `need_key`；每次（重）连后所有在线层都等各自的 IDR，`request_keyframe` 回调一次覆盖所有层。队列超 75% 时只丢非关键帧、按层标记。
+- **CLI**：`ts_demux` 识别 PMT 里同 codec 的多路视频（≤4，HEVC 多于 3 路时忽略多出的并警告），回调带 `layer`；`--bitrate-kbps A,B,C` 给每层标称码率。
+
+### 10.3 验证
+
+- `test_ts`：1–4 层 PMT 与 PID、裁剪阶梯（`first_layer`）、PCR 只在第一条在线层、每层独立 CC/参数集缓存、`flush_after` 与单 PAT/PMT、层数上限与非法参数。
+- `test_session`：真实 libsrt 监听器解析首个 SRT 消息里的 PMT：3 层 → 模拟 `TARGET_STATE.layers=2` → 以只含最低两层的 PMT 重握手（PCR 移到第 1 层、新 token、`on_layers(1,2)`、被砍层返回 `LAYER_OFF`、各层码率回调）→ 模拟 0.5s 后要求加回，**被 5 秒防抖延后**到约 5 秒后恢复 3 层。
+- `interop_mediacommon`：`mediacommon` 读取 4 层 H.264 和 3 层 HEVC（含 SEI），每层独立解码、关键帧带自己的参数集。
+- 本地真实 ppmmx 端到端：4 层 H.264 + Opus、3 层 HEVC + AAC；ppmmx 日志确认 `SRT publish contains N … video tracks; treating them as a simulcast ladder`、`max layers set to N`，重启 ppmmx 后重新取 token 恢复。
+- **未覆盖**：真实丢包下 ppmmx 状态机自己砍层（本地没有网络损伤工具，砍层由模拟的 `TARGET_STATE` 驱动）；对生产 ppmmx 的同播推流。

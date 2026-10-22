@@ -629,6 +629,214 @@ static void test_sei_timestamp(void)
 	}
 }
 
+
+/* ---------- simulcast layers ---------- */
+
+static pp_ts *mkl(int codec, int layers, int first, int audio)
+{
+	pp_ts_config c;
+	memset(&c, 0, sizeof c);
+	c.video_codec = codec;
+	c.video_layers = layers;
+	c.first_layer = first;
+	c.audio_codec = audio;
+	c.audio_channels = 2;
+	c.sink = sink;
+	reset();
+	return pp_ts_create(&c);
+}
+
+/* PMT video ES PIDs in declaration order; returns the count, *pcr = PCR PID */
+static int pmt_video_pids(int *pids, int *pcr, int *audio_pid)
+{
+	size_t i, count = g_n / 188;
+	for (i = 0; i < count; i++) {
+		const uint8_t *p = pkt(i);
+		if (pkt_pid(p) == PP_PID_PMT && (p[1] & 0x40)) {
+			const uint8_t *s = p + 5;
+			int sl = 3 + (((s[1] & 0x0F) << 8) | s[2]);
+			int pos = 12 + (((s[10] & 0x0F) << 8) | s[11]), end = sl - 4, n = 0;
+			CHECK_INT(pp_crc32_mpeg(s, (size_t)sl), 0);
+			*pcr = ((s[8] & 0x1F) << 8) | s[9];
+			*audio_pid = 0;
+			while (pos + 5 <= end) {
+				int st = s[pos], es = ((s[pos + 1] & 0x1F) << 8) | s[pos + 2];
+				if (st == 0x1B || st == 0x24)
+					pids[n++] = es;
+				else
+					*audio_pid = es;
+				pos += 5 + (((s[pos + 3] & 0x0F) << 8) | s[pos + 4]);
+			}
+			return n;
+		}
+	}
+	return -1;
+}
+
+static size_t layer_au(uint8_t *au, int key, uint8_t sps_tag)
+{
+	uint8_t sps[8] = {0x67, 0x42, 0xC0, 0x1F, 0xDA, 0x01, 0x40, 0};
+	uint8_t pps[4] = {0x68, 0xCE, 0x3C, 0x80};
+	uint8_t slice[120];
+	size_t o = 0, i;
+	sps[7] = sps_tag;
+	slice[0] = key ? 0x65 : 0x41;
+	for (i = 1; i < sizeof slice; i++)
+		slice[i] = (uint8_t)(i * 5 + sps_tag) | 1;
+	if (key) {
+		o += put_nal(au + o, 1, sps, sizeof sps);
+		o += put_nal(au + o, 1, pps, sizeof pps);
+	}
+	o += put_nal(au + o, 1, slice, sizeof slice);
+	return o;
+}
+
+static void test_layers_pmt(void)
+{
+	int pids[8], pcr, apid, n;
+	pp_ts *ts;
+
+	/* H.264 four layers: ES order = layer order (highest first), PCR on layer 0, audio on its own PID */
+	ts = mkl(PP_CODEC_H264, 4, 0, PP_AUDIO_OPUS);
+	CHECK(ts != NULL);
+	pp_ts_write_tables(ts);
+	pp_ts_flush(ts);
+	n = pmt_video_pids(pids, &pcr, &apid);
+	CHECK_INT(n, 4);
+	CHECK_INT(pids[0], 0x100);
+	CHECK_INT(pids[1], 0x101);
+	CHECK_INT(pids[2], 0x102);
+	CHECK_INT(pids[3], 0x103);
+	CHECK_INT(pcr, 0x100);
+	CHECK_INT(apid, PP_PID_AUDIO);
+	pp_ts_destroy(ts);
+
+	/* degrade cut layers 0 and 1: ladder = layers 2,3; PCR follows the first remaining layer */
+	ts = mkl(PP_CODEC_H264, 4, 2, PP_AUDIO_OPUS);
+	pp_ts_write_tables(ts);
+	pp_ts_flush(ts);
+	n = pmt_video_pids(pids, &pcr, &apid);
+	CHECK_INT(n, 2);
+	CHECK_INT(pids[0], 0x102);
+	CHECK_INT(pids[1], 0x103);
+	CHECK_INT(pcr, 0x102);
+	{
+		uint8_t au[512];
+		size_t len = layer_au(au, 1, 1);
+		CHECK_INT(pp_ts_write_video_layer(ts, 0, au, len, 0, 0, 1, 0, 1), PP_TS_E_LAYER);
+		CHECK_INT(pp_ts_write_video_layer(ts, 1, au, len, 0, 0, 1, 0, 1), PP_TS_E_LAYER);
+		CHECK_INT(pp_ts_write_video_layer(ts, 2, au, len, 0, 0, 1, 0, 1), 0);
+		CHECK_INT(pp_ts_write_video_layer(ts, 3, au, len, 0, 0, 1, 0, 1), 0);
+		CHECK_INT(pp_ts_write_video_layer(ts, 4, au, len, 0, 0, 1, 0, 1), PP_TS_E_LAYER);
+	}
+	pp_ts_destroy(ts);
+
+	/* HEVC three layers: stream_type 0x24 for every one */
+	ts = mkl(PP_CODEC_HEVC, 3, 0, PP_AUDIO_AAC);
+	pp_ts_write_tables(ts);
+	pp_ts_flush(ts);
+	CHECK_INT(pmt_video_pids(pids, &pcr, &apid), 3);
+	{
+		const uint8_t *s = pkt(1) + 5;
+		CHECK_INT(s[12], 0x24);
+		CHECK_INT(s[17], 0x24);
+		CHECK_INT(s[22], 0x24);
+		CHECK_INT(s[27], 0x0F);
+	}
+	pp_ts_destroy(ts);
+
+	/* ladder limits: ppmmx accepts at most 4 H.264 / 3 HEVC video tracks */
+	CHECK(mkl(PP_CODEC_H264, 5, 0, PP_AUDIO_NONE) == NULL);
+	CHECK(mkl(PP_CODEC_HEVC, 4, 0, PP_AUDIO_NONE) == NULL);
+	CHECK(mkl(PP_CODEC_H264, 2, 2, PP_AUDIO_NONE) == NULL); /* first layer beyond the ladder */
+	CHECK(mkl(PP_CODEC_H264, -1, 0, PP_AUDIO_NONE) == NULL);
+	ts = mkl(PP_CODEC_H264, 0, 0, PP_AUDIO_NONE); /* 0 means one layer */
+	CHECK(ts != NULL);
+	pp_ts_destroy(ts);
+}
+
+static void test_layers_streams(void)
+{
+	pp_ts *ts = mkl(PP_CODEC_H264, 3, 0, PP_AUDIO_OPUS);
+	uint8_t au[512];
+	size_t len, i, count, pats = 0;
+	int64_t t = 90000;
+	int l, f;
+	int pcr_on_layer[3] = {0, 0, 0};
+
+	/* a message is only completed by the last layer of a frame, so the three layers share messages */
+	len = layer_au(au, 1, 0xA0);
+	CHECK_INT(pp_ts_write_video_layer(ts, 0, au, len, t, t, 1, 0, 0), 0);
+	CHECK_INT(g_msgs, 0); /* tables + layer 0 are still pending in the partial message, nothing flushed yet */
+	len = layer_au(au, 1, 0xA1);
+	CHECK_INT(pp_ts_write_video_layer(ts, 1, au, len, t, t, 1, 0, 0), 0);
+	len = layer_au(au, 1, 0xA2);
+	CHECK_INT(pp_ts_write_video_layer(ts, 2, au, len, t, t, 1, 0, 1), 0);
+	CHECK(g_msgs >= 1);
+	CHECK_INT(g_n % 1316, 0);
+
+	/* one PAT/PMT for the keyframe instant, not one per layer */
+	count = g_n / 188;
+	for (i = 0; i < count; i++)
+		if (pkt_pid(pkt(i)) == 0)
+			pats++;
+	CHECK_INT(pats, 1);
+
+	/* every layer is its own PID with its own PES, PCR only on layer 0, RAI on all keyframes */
+	for (l = 0; l < 3; l++) {
+		CHECK(get_pes(PP_PID_VIDEO_LAYER(l), 0));
+		CHECK_INT(g_pes.af_rai, 1);
+		pcr_on_layer[l] = g_pes.af_pcr;
+	}
+	CHECK_INT(pcr_on_layer[0], 1);
+	CHECK_INT(pcr_on_layer[1], 0);
+	CHECK_INT(pcr_on_layer[2], 0);
+
+	/* many frames: per-PID continuity counters stay independent and gapless */
+	for (f = 1; f < 40; f++) {
+		int key = f % 20 == 0;
+		t += 3000;
+		for (l = 0; l < 3; l++) {
+			len = layer_au(au, key, (uint8_t)(0xA0 + l));
+			CHECK_INT(pp_ts_write_video_layer(ts, l, au, len, t, t, key, 0, l == 2), 0);
+		}
+	}
+	pp_ts_flush(ts);
+	check_stream_integrity();
+	pp_ts_destroy(ts);
+}
+
+static void test_layers_param_sets(void)
+{
+	/* each layer has its own SPS (different resolution): a keyframe that lost them is repaired from ITS layer's cache */
+	pp_ts *ts = mkl(PP_CODEC_H264, 2, 0, PP_AUDIO_NONE);
+	uint8_t au[512];
+	size_t len;
+	const uint8_t *d;
+
+	len = layer_au(au, 1, 0x11);
+	pp_ts_write_video_layer(ts, 0, au, len, 0, 0, 1, 0, 0);
+	len = layer_au(au, 1, 0x22);
+	pp_ts_write_video_layer(ts, 1, au, len, 0, 0, 1, 0, 1);
+
+	len = layer_au(au, 0, 0x22);               /* an IDR slice without in-band parameter sets, layer 1 */
+	au[4] = 0x65;
+	pp_ts_write_video_layer(ts, 1, au, len, 3000, 3000, 1, 0, 1);
+	CHECK(get_pes(PP_PID_VIDEO_LAYER(1), 1));
+	d = g_pes.data + 14 + 6;                   /* after PES header and AUD */
+	CHECK_INT(d[4], 0x67);
+	CHECK_INT(d[4 + 7], 0x22);                 /* layer 1's SPS tag, not layer 0's 0x11 */
+
+	len = layer_au(au, 0, 0x11);
+	au[4] = 0x65;
+	pp_ts_write_video_layer(ts, 0, au, len, 3000, 3000, 1, 0, 1);
+	CHECK(get_pes(PP_PID_VIDEO_LAYER(0), 1));
+	d = g_pes.data + 14 + 6;
+	CHECK_INT(d[4], 0x67);
+	CHECK_INT(d[4 + 7], 0x11);
+	pp_ts_destroy(ts);
+}
+
 static void test_invalid_input(void)
 {
 	pp_ts_config c;
@@ -669,6 +877,9 @@ int main(void)
 	RUN(test_message_framing_and_cc);
 	RUN(test_flush_pads_with_null_packets);
 	RUN(test_sei_timestamp);
+	RUN(test_layers_pmt);
+	RUN(test_layers_streams);
+	RUN(test_layers_param_sets);
 	RUN(test_invalid_input);
 	TEST_DONE();
 }

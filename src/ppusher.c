@@ -61,6 +61,8 @@ struct ppusher {
 	int bitrate_pct;
 	int bitrate_dirty;
 	int ev_reconnect, ev_loss;
+	int target_layers; /* what ppmmx wants (TARGET_STATE.layers), clamped to 1..video_layers */
+	int active_pub;    /* layers in the live ladder, for stats */
 	int latency_hint_ms;
 	pp_loss_monitor loss;
 	pp_loss_config loss_cfg;
@@ -73,7 +75,8 @@ struct ppusher {
 	pthread_mutex_t mux_mu;
 	pp_ts *ts;
 	volatile int accept_media;
-	volatile int need_key;
+	volatile int need_key[PPUSHER_MAX_LAYERS];
+	volatile int active_first; /* first layer in the live ladder (layers below it were cut) */
 	int64_t last_audio_ms;
 
 	/* send queue (ring of 1316-byte messages) */
@@ -89,6 +92,7 @@ struct ppusher {
 	pp_publish_decision *dec;
 	char streamid[PP_STREAMID_MAX + 8];
 	char endpoint[256];
+	int active_count; /* session thread's view of the live ladder size */
 	int64_t last_kf_req_ms, last_stats_ms;
 	int64_t prev_sent, prev_loss, prev_retrans;
 	int stats_primed;
@@ -128,6 +132,7 @@ void ppusher_config_default(ppusher_config_t *c)
 	c->audio_codec = PPUSHER_AUDIO_OPUS;
 	c->audio_channels = 2;
 	c->audio_sample_rate = 48000;
+	c->video_layers = 1;
 	c->codec_path = 1;
 	c->enable_degrade = 1;
 	c->loss_reconnect_enable = 1;
@@ -169,11 +174,19 @@ ppusher_t *ppusher_create(const ppusher_config_t *cfg, const ppusher_callbacks_t
 		return NULL;
 	if (cfg->audio_codec == PPUSHER_AUDIO_OPUS && cfg->audio_channels != 1 && cfg->audio_channels != 2)
 		return NULL;
+	/* ppmmx rejects a SRT publish with more video tracks than this (mpegts.ValidateVideoTracks) */
+	if (cfg->video_layers < 0 ||
+	    cfg->video_layers > (cfg->video_codec == PPUSHER_CODEC_HEVC ? PPUSHER_MAX_LAYERS_HEVC : PPUSHER_MAX_LAYERS_H264))
+		return NULL;
 
 	p = (ppusher_t *)calloc(1, sizeof *p);
 	if (!p)
 		return NULL;
 	p->cfg = *cfg;
+	if (p->cfg.video_layers == 0)
+		p->cfg.video_layers = 1;
+	p->target_layers = p->cfg.video_layers;
+	p->active_count = p->active_pub = p->cfg.video_layers;
 	if (cb)
 		p->cb = *cb;
 	if (copy_str(p->s_url, sizeof p->s_url, cfg->ppcenter_url) || copy_str(p->s_app, sizeof p->s_app, cfg->app_id) ||
@@ -297,33 +310,41 @@ static void req_keyframe(ppusher_t *p)
 		p->cb.request_keyframe(p->cb.ud);
 }
 
-int ppusher_push_video(ppusher_t *p, const uint8_t *au, size_t len, int64_t pts_us, int64_t dts_us, int is_key)
+int ppusher_push_video(ppusher_t *p, int layer, const uint8_t *au, size_t len, int64_t pts_us, int64_t dts_us,
+		       int is_key)
 {
 	int rc = PPUSHER_OK, want_kf = 0;
 
-	if (!p || !au || !len)
+	if (!p || !au || !len || layer < 0 || layer >= p->cfg.video_layers)
 		return PPUSHER_E_ARG;
 	if (!p->accept_media)
 		return PPUSHER_E_NOT_CONNECTED;
+	if (layer < p->active_first)
+		return PPUSHER_E_LAYER_OFF;
 	pthread_mutex_lock(&p->mux_mu);
 	if (!p->ts) {
 		rc = PPUSHER_E_NOT_CONNECTED;
-	} else if (p->need_key && !is_key) {
+	} else if (layer < p->active_first) {
+		rc = PPUSHER_E_LAYER_OFF;
+	} else if (p->need_key[layer] && !is_key) {
 		p->frames_dropped++;
 		rc = PPUSHER_E_DROPPED;
 	} else if (!is_key && q_fill_pct(p) >= 75) {
 		/* the link can't keep up: shed non-key frames until the next IDR */
 		p->frames_dropped++;
-		p->need_key = 1;
+		p->need_key[layer] = 1;
 		want_kf = 1;
 		rc = PPUSHER_E_DROPPED;
 	} else {
-		int r = pp_ts_write_video(p->ts, au, len, pts_us * 9 / 100, dts_us * 9 / 100, is_key,
-					  p->cfg.enable_sei_timestamp ? pp_wall_ms() : 0);
+		/* the last layer of a frame closes the SRT message; the others share it */
+		int r = pp_ts_write_video_layer(p->ts, layer, au, len, pts_us * 9 / 100, dts_us * 9 / 100, is_key,
+						p->cfg.enable_sei_timestamp ? pp_wall_ms() : 0,
+						layer == p->cfg.video_layers - 1);
 		if (r == 0)
-			p->need_key = 0;
+			p->need_key[layer] = 0;
 		else
-			rc = r == -2 ? PPUSHER_E_NOMEM : PPUSHER_E_MUX;
+			rc = r == -2 ? PPUSHER_E_NOMEM : r == PP_TS_E_LAYER ? PPUSHER_E_LAYER_OFF : PPUSHER_E_MUX;
+		p->last_audio_ms = pp_now_ms(); /* pending bytes (any stream) get flushed after 25 ms */
 	}
 	pthread_mutex_unlock(&p->mux_mu);
 	if (want_kf)
@@ -381,6 +402,9 @@ static void ws_handle_message(ppusher_t *p, const char *json, size_t n)
 		}
 		if (flags & PP_TGT_RECONNECT)
 			p->ev_reconnect = 1;
+		/* degrade cuts the highest layers: keep the lowest N; applied by re-handshaking with a trimmed PMT */
+		if (m.layers > 0)
+			p->target_layers = m.layers > p->cfg.video_layers ? p->cfg.video_layers : m.layers;
 		pthread_mutex_unlock(&p->mu);
 		plog(p, PPUSHER_LOG_INFO, "TARGET_STATE layers=%d bitrate=%d%% latency=%dms%s%s%s", m.layers,
 		     m.bitrate_percent, m.latency_ms, m.reconnect ? " reconnect" : "", m.reason[0] ? " reason=" : "",
@@ -564,7 +588,7 @@ static int do_connect_event(ppusher_t *p)
 	int port, v, lat;
 	struct addrinfo hints, *res = NULL, *ai;
 	pp_ts_config tc;
-	int ok = 0;
+	int ok = 0, i;
 
 	set_state(p, PPUSHER_STATE_CONNECTING, p->endpoint);
 	if (pp_split_endpoint(p->endpoint, host, sizeof host, &port, SRT_DEFAULT_PORT) != 0) {
@@ -582,6 +606,8 @@ static int do_connect_event(ppusher_t *p)
 
 	pthread_mutex_lock(&p->mu);
 	lat = p->cfg.srt_latency_ms > p->latency_hint_ms ? p->cfg.srt_latency_ms : p->latency_hint_ms;
+	p->active_count = p->target_layers; /* the ladder this connection will carry */
+	p->active_pub = p->active_count;
 	pthread_mutex_unlock(&p->mu);
 
 	for (ai = res; ai && !ok && !p->stop; ai = ai->ai_next) {
@@ -616,6 +642,8 @@ static int do_connect_event(ppusher_t *p)
 
 	memset(&tc, 0, sizeof tc);
 	tc.video_codec = p->cfg.video_codec == PPUSHER_CODEC_HEVC ? PP_CODEC_HEVC : PP_CODEC_H264;
+	tc.video_layers = p->cfg.video_layers;
+	tc.first_layer = p->cfg.video_layers - p->active_count;
 	tc.audio_codec = p->cfg.audio_codec;
 	tc.audio_channels = p->cfg.audio_channels;
 	tc.audio_sample_rate = p->cfg.audio_sample_rate;
@@ -629,7 +657,9 @@ static int do_connect_event(ppusher_t *p)
 		pp_ts_write_tables(p->ts); /* PAT+PMT lead the stream */
 	if (p->ts)
 		pp_ts_flush(p->ts);
-	p->need_key = 1;
+	for (i = 0; i < PPUSHER_MAX_LAYERS; i++)
+		p->need_key[i] = 1;
+	p->active_first = tc.first_layer;
 	p->last_audio_ms = pp_now_ms();
 	pthread_mutex_unlock(&p->mux_mu);
 	if (!p->ts) {
@@ -649,6 +679,11 @@ static int do_connect_event(ppusher_t *p)
 	p->last_stats_ms = 0;
 	p->tail_timeouts = 0;
 
+	if (p->cb.on_layers)
+		p->cb.on_layers(tc.first_layer, p->active_count, p->cb.ud);
+	if (p->active_count < p->cfg.video_layers)
+		plog(p, PPUSHER_LOG_INFO, "ladder trimmed by degrade: publishing the lowest %d of %d layers", p->active_count,
+		     p->cfg.video_layers);
 	p->accept_media = 1;
 	set_state(p, PPUSHER_STATE_STREAMING, p->endpoint);
 	plog(p, PPUSHER_LOG_INFO, "SRT connected to %s:%d", host, port);
@@ -667,7 +702,7 @@ static int streaming_step(ppusher_t *p)
 	uint8_t msg[PP_TS_MSG_SIZE];
 	int budget = 64, ev_ws = 0;
 	int64_t now;
-	int dirty = 0, pct = 100;
+	int dirty = 0, pct = 100, want_layers;
 
 	while (budget-- > 0 && !p->stop) {
 		if (!q_pop(p, msg, budget == 63 ? 40 : 0))
@@ -695,8 +730,13 @@ static int streaming_step(ppusher_t *p)
 	flush_stale_audio(p);
 
 	now = pp_now_ms();
-	if (p->need_key && now - p->last_kf_req_ms >= KEYFRAME_RETRY_MS)
-		req_keyframe(p);
+	{
+		int need = 0, i;
+		for (i = p->active_first; i < p->cfg.video_layers; i++)
+			need |= p->need_key[i];
+		if (need && now - p->last_kf_req_ms >= KEYFRAME_RETRY_MS)
+			req_keyframe(p);
+	}
 
 	if (now - p->last_stats_ms >= SRT_STATS_MS) {
 		SRT_TRACEBSTATS st;
@@ -744,21 +784,31 @@ static int streaming_step(ppusher_t *p)
 		pct = p->bitrate_pct;
 		p->bitrate_dirty = 0;
 	}
+	want_layers = p->target_layers;
 	if (p->ev_reconnect) {
 		p->ev_reconnect = 0;
 		ev_ws = PP_EV_RECONNECT_REQ;
 	} else if (p->ev_loss) {
 		p->ev_loss = 0;
 		ev_ws = PP_EV_LOSS_TRIP;
+	} else if (want_layers != p->active_count) {
+		/* not a one-shot flag: re-evaluated every step so a request swallowed by the 5 s anti-storm guard is retried */
+		ev_ws = PP_EV_RECONNECT_REQ;
 	}
 	pthread_mutex_unlock(&p->mu);
-	if (dirty && p->cb.set_bitrate && p->cfg.video_bitrate_kbps > 0) {
-		int kbps = (int)((int64_t)p->cfg.video_bitrate_kbps * pct / 100);
-		plog(p, PPUSHER_LOG_INFO, "encoder bitrate -> %d kbps (%d%%)", kbps, pct);
-		p->cb.set_bitrate(kbps, p->cb.ud);
+	if (dirty && p->cb.set_bitrate) {
+		int l;
+		for (l = p->active_first; l < p->cfg.video_layers; l++) {
+			int kbps;
+			if (p->cfg.video_bitrate_kbps[l] <= 0)
+				continue;
+			kbps = (int)((int64_t)p->cfg.video_bitrate_kbps[l] * pct / 100);
+			plog(p, PPUSHER_LOG_INFO, "encoder bitrate layer %d -> %d kbps (%d%%)", l, kbps, pct);
+			p->cb.set_bitrate(l, kbps, p->cb.ud);
+		}
 	}
 	if (ev_ws) {
-		if (ev_ws == PP_EV_RECONNECT_REQ)
+		if (ev_ws == PP_EV_RECONNECT_REQ && want_layers == p->active_count)
 			plog(p, PPUSHER_LOG_INFO, "ppmmx asked for a reconnect (new SRT latency applies on the next handshake)");
 		return ev_ws;
 	}
@@ -802,6 +852,15 @@ static void *session_thread(void *arg)
 		if (ev >= 0) {
 			int prev = p->sm.state;
 			a = pp_sm_handle(&p->sm, (pp_event)ev, pp_now_ms(), pp_rand32());
+			if (a == PP_ACT_CLOSE_AND_FETCH && ev == PP_EV_RECONNECT_REQ) {
+				int want;
+				pthread_mutex_lock(&p->mu);
+				want = p->target_layers;
+				pthread_mutex_unlock(&p->mu);
+				if (want != p->active_count)
+					plog(p, PPUSHER_LOG_INFO, "degrade changed the ladder %d -> %d layers: re-handshaking",
+					     p->active_count, want);
+			}
 			if (a == PP_ACT_CLOSE_AND_FETCH || ev == PP_EV_LINK_BROKEN || ev == PP_EV_CONNECT_FAIL)
 				link_close(p);
 			if (p->sm.state == PP_ST_BACKOFF && prev != PP_ST_BACKOFF) {
@@ -877,6 +936,7 @@ int ppusher_get_stats(ppusher_t *p, ppusher_stats_t *o)
 	o->state = p->state_pub;
 	o->reconnects = p->reconnects;
 	o->bitrate_percent = p->bitrate_pct;
+	o->active_layers = p->active_pub;
 	o->degrade_connected = p->ws_connected;
 	o->last_loss_pct = p->last_loss_pct;
 	o->rtt_ms = p->rtt_ms;

@@ -39,7 +39,8 @@ typedef struct {
 	const char *input, *dry_run, *ca_file, *passphrase;
 	const char *direct, *direct_token, *direct_ws, *direct_ws_token;
 	int codec; /* 0 = detect */
-	int bitrate_kbps, latency_ms, no_degrade, sei, no_codec_path, insecure, verbose, loop, realtime;
+	const char *bitrate_list; /* "layer0,layer1,..." nominal kbps */
+	int latency_ms, no_degrade, sei, no_codec_path, insecure, verbose, loop, realtime;
 } opts_t;
 
 typedef struct {
@@ -48,7 +49,7 @@ typedef struct {
 	FILE *dry;
 	pp_ts *dts_mux;
 	int64_t first_pts_us, start_wall_ms, loop_offset_us, last_video_us;
-	int have_first, warned_bframes, have_raw_first;
+	int have_first, warned_bframes, have_raw_first, nlayers;
 	int64_t raw_first_us, raw_last_us;
 	uint64_t video_n, audio_n;
 } app_t;
@@ -61,8 +62,9 @@ static void on_sigint(int sig)
 	g_quit = 1;
 }
 
-static void noop_video(const uint8_t *au, size_t len, int64_t pts90, int64_t dts90, void *ud)
+static void noop_video(int layer, const uint8_t *au, size_t len, int64_t pts90, int64_t dts90, void *ud)
 {
+	(void)layer;
 	(void)au; (void)len; (void)pts90; (void)dts90; (void)ud;
 }
 
@@ -86,10 +88,17 @@ static void on_state(int st, const char *info, void *ud)
 	fprintf(stderr, "[state] %s %s\n", st >= 0 && st < 7 ? n[st] : "?", info);
 }
 
-static void on_bitrate(int kbps, void *ud)
+static void on_bitrate(int layer, int kbps, void *ud)
 {
 	(void)ud;
-	fprintf(stderr, "[degrade] a real encoder would now be set to %d kbps (this CLI replays a fixed file/stream)\n", kbps);
+	fprintf(stderr, "[degrade] a real encoder would now set layer %d to %d kbps (this CLI replays a fixed file/stream)\n",
+		layer, kbps);
+}
+
+static void on_layers(int first, int count, void *ud)
+{
+	(void)ud;
+	fprintf(stderr, "[layers] publishing layers %d..%d (%d active)\n", first, first + count - 1, count);
 }
 
 static void on_keyframe(void *ud)
@@ -135,30 +144,35 @@ static int is_key_au(int codec, const uint8_t *au, size_t n)
 	return 0;
 }
 
-static void cb_video(const uint8_t *au, size_t len, int64_t pts90, int64_t dts90, void *ud)
+static void cb_video(int layer, const uint8_t *au, size_t len, int64_t pts90, int64_t dts90, void *ud)
 {
 	app_t *a = (app_t *)ud;
 	int64_t raw = dts90 * 100 / 9;
 	int64_t us = raw + a->loop_offset_us;
 	int key = is_key_au(a->o.codec, au, len);
 
+	if (layer >= a->nlayers)
+		return; /* more streams than the codec's ladder limit */
+
 	if (pts90 != dts90 && !a->warned_bframes) {
 		a->warned_bframes = 1;
 		fprintf(stderr, "[warn] input has B-frames (PTS != DTS); libppusher needs B-frames = 0 - using DTS. "
 				"Re-encode with -bf 0.\n");
 	}
-	if (!a->have_raw_first) {
-		a->have_raw_first = 1;
-		a->raw_first_us = raw;
+	if (layer == 0) {
+		if (!a->have_raw_first) {
+			a->have_raw_first = 1;
+			a->raw_first_us = raw;
+		}
+		a->raw_last_us = raw;
+		a->video_n++;
+		pace(a, us); /* one pacing point per frame: layers of a frame share its timestamp */
 	}
-	a->raw_last_us = raw;
-	pace(a, us);
 	a->last_video_us = us;
-	a->video_n++;
 	if (a->dts_mux) {
-		pp_ts_write_video(a->dts_mux, au, len, us * 9 / 100, us * 9 / 100, key, 0);
+		pp_ts_write_video_layer(a->dts_mux, layer, au, len, us * 9 / 100, us * 9 / 100, key, 0, layer == a->nlayers - 1);
 	} else {
-		int rc = ppusher_push_video(a->p, au, len, us, us, key);
+		int rc = ppusher_push_video(a->p, layer, au, len, us, us, key);
 		if (a->o.verbose && rc != PPUSHER_OK && rc != PPUSHER_E_NOT_CONNECTED)
 			fprintf(stderr, "[push_video] rc=%d\n", rc);
 	}
@@ -260,7 +274,7 @@ static void usage(void)
 	      "  --loop                           repeat a file input forever\n"
 	      "  --realtime / --no-realtime       pace by timestamps (default: on for files only)\n"
 	      "  --codec h264|hevc                default: detect from the PMT\n"
-	      "  --bitrate-kbps N                 nominal encoder bitrate, used to print degrade targets\n"
+	      "  --bitrate-kbps A[,B,..]          nominal per-layer encoder bitrate (layer 0 first), used to print degrade targets\n"
 	      "  --no-degrade                     do not open the ppmmx degrade WebSocket\n"
 	      "  --no-codec-path                  publish on the bare <app>/<stream> path (pplayer can't play it)\n"
 	      "  --sei                            inject the OBS-ABSTS-SEI-v1 timestamp into every video AU\n"
@@ -294,7 +308,7 @@ int main(int argc, char **argv)
 	char secret[256] = "";
 	ppusher_config_t cfg;
 	ppusher_callbacks_t pcb;
-	int vcodec, acodec, ach = 2, arate = 48000;
+	int vcodec, acodec, ach = 2, arate = 48000, nlayers = 1, li;
 	uint8_t *pre = NULL;
 	size_t pre_n = 0, pre_cap = 0;
 
@@ -319,7 +333,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--codec")) {
 			const char *v = arg(argc, argv, &i);
 			o->codec = !strcmp(v, "hevc") ? PPUSHER_CODEC_HEVC : !strcmp(v, "h264") ? PPUSHER_CODEC_H264 : 0;
-		} else if (!strcmp(a, "--bitrate-kbps")) o->bitrate_kbps = atoi(arg(argc, argv, &i));
+		} else if (!strcmp(a, "--bitrate-kbps")) o->bitrate_list = arg(argc, argv, &i);
 		else if (!strcmp(a, "--no-degrade")) o->no_degrade = 1;
 		else if (!strcmp(a, "--no-codec-path")) o->no_codec_path = 1;
 		else if (!strcmp(a, "--sei")) o->sei = 1;
@@ -398,6 +412,7 @@ int main(int argc, char **argv)
 		vcodec = tsd_video_codec(probe) == TSD_VIDEO_HEVC ? PPUSHER_CODEC_HEVC : PPUSHER_CODEC_H264;
 		acodec = tsd_audio_codec(probe) == TSD_AUDIO_OPUS ? PPUSHER_AUDIO_OPUS :
 			 tsd_audio_codec(probe) == TSD_AUDIO_AAC ? PPUSHER_AUDIO_AAC : PPUSHER_AUDIO_NONE;
+		nlayers = tsd_video_layers(probe);
 		ach = tsd_audio_channels(probe);
 		arate = tsd_audio_rate(probe);
 		tsd_destroy(probe);
@@ -406,13 +421,24 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[warn] --codec says %s but the stream is %s; using the stream's codec (mmx checks path vs. PMT)\n",
 			o->codec == PPUSHER_CODEC_HEVC ? "hevc" : "h264", vcodec == PPUSHER_CODEC_HEVC ? "hevc" : "h264");
 	o->codec = vcodec;
-	fprintf(stderr, "input: %s video, %s audio\n", vcodec == PPUSHER_CODEC_HEVC ? "HEVC" : "H.264",
+	{
+		int max = vcodec == PPUSHER_CODEC_HEVC ? PPUSHER_MAX_LAYERS_HEVC : PPUSHER_MAX_LAYERS_H264;
+		if (nlayers > max) {
+			fprintf(stderr, "[warn] input has %d video streams; ppmmx allows at most %d %s layers, ignoring the rest\n",
+				nlayers, max, vcodec == PPUSHER_CODEC_HEVC ? "HEVC" : "H.264");
+			nlayers = max;
+		}
+	}
+	app.nlayers = nlayers;
+	fprintf(stderr, "input: %d x %s video layer%s, %s audio\n", nlayers, vcodec == PPUSHER_CODEC_HEVC ? "HEVC" : "H.264",
+		nlayers > 1 ? "s (simulcast, first = highest)" : "",
 		acodec == PPUSHER_AUDIO_OPUS ? "Opus" : acodec == PPUSHER_AUDIO_AAC ? "AAC" : "no");
 
 	if (o->dry_run) {
 		pp_ts_config tc;
 		memset(&tc, 0, sizeof tc);
 		tc.video_codec = vcodec == PPUSHER_CODEC_HEVC ? PP_CODEC_HEVC : PP_CODEC_H264;
+		tc.video_layers = nlayers;
 		tc.audio_codec = acodec;
 		tc.audio_channels = ach;
 		tc.audio_sample_rate = arate;
@@ -441,7 +467,17 @@ int main(int argc, char **argv)
 		cfg.audio_codec = acodec;
 		cfg.audio_channels = ach > 0 ? ach : 2;
 		cfg.audio_sample_rate = arate > 0 ? arate : 48000;
-		cfg.video_bitrate_kbps = o->bitrate_kbps;
+		cfg.video_layers = nlayers;
+		if (o->bitrate_list) { /* "1500" or "3000,1500,600" */
+			const char *q = o->bitrate_list;
+			for (li = 0; li < nlayers && *q; li++) {
+				cfg.video_bitrate_kbps[li] = atoi(q);
+				while (*q && *q != ',')
+					q++;
+				if (*q == ',')
+					q++;
+			}
+		}
 		cfg.codec_path = !o->no_codec_path;
 		cfg.enable_degrade = !o->no_degrade;
 		cfg.enable_sei_timestamp = o->sei;
@@ -455,6 +491,7 @@ int main(int argc, char **argv)
 		cfg.direct_ws_token = o->direct_ws_token;
 		memset(&pcb, 0, sizeof pcb);
 		pcb.set_bitrate = on_bitrate;
+		pcb.on_layers = on_layers;
 		pcb.request_keyframe = on_keyframe;
 		pcb.on_state = on_state;
 		pcb.on_log = on_log;

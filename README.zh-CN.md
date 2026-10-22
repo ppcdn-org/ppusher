@@ -5,6 +5,7 @@
 硬件编码器把 **H.264 / HEVC 的 Annex-B 码流**和 **Opus（或 AAC）音频帧**推进来，库内完成：
 
 - 轻量 MPEG-TS 复用（与 ppmmx 的 SRT 摄取校验兼容），经 libsrt 发往 PPCDN Origin；
+- **SRT 同播（simulcast）**：同一条 SRT 连接里发多层视频，**H.264 最多 4 层、HEVC 最多 3 层**（ppmmx 的上限），降级时按 ppmmx 的 `TARGET_STATE.layers` 砍最高层并重握手；
 - 向 ppcenter 换推流节点和 **每次连接都全新的 token**；
 - 与 ppmmx 的**降级/丢包控制通道**（WebSocket）对接：执行码率调整、处理 `reconnect`、消费 `LOSS_SAMPLE`；
 - **重连状态机**：断线指数退避、mmx 要求重连、本地丢包窗口超阈值快速重连。
@@ -35,6 +36,8 @@
 | token 有效期 | 每次**进入取节点阶段**（首次、断线、`reconnect`、丢包重连）都重新向 ppcenter 取 token，**从不复用** | 设计文档“过期与重连” |
 | 降级通道 | 把 `whipTracks[codec].url`（`https://…/{path}/whip`）换成 `wss://…/{path}/ws/whip`；`Authorization: Bearer <whipTracks 的 bearerToken>`；连上后发 `CLIENT_INFO`；SRT 连上**之后**才连（与 ppobs 同序） | ppmmx `webrtc/degrade_ws_handler.go`；`docs/design/publish-degrade-protocol.zh-CN.md` §6 |
 | `TARGET_STATE` | `bitrate_percent` 变化 → 回调 `set_bitrate(基准码率 × 百分比)`（不重启编码器）；相同状态幂等忽略；`layers` 仅记录（单层编码器已在终止态）；`latency_ms` 记下，**下次握手**用作 SRT 延迟 | ppmmx `internal/degrade/degrade.go` |
+| 同播层数 | 一条连接里多条视频 elementary stream，PMT 顺序 = 层顺序（**第 0 层 = 最高画质**，ppmmx 把 PMT 顺序当作 highest → lowest）；H.264 ≤ 4、HEVC ≤ 3，同一连接只能同一种 codec（超限 ppmmx 直接拒绝，库在创建时就拒绝）。每层各有自己的 SPS/PPS 与 IDR，同一帧的各层共用 pts | ppmmx `protocols/mpegts/video_tracks.go::ValidateVideoTracks`；`srt/conn.go` |
+| `TARGET_STATE.layers` | 层数变化（砍最高层 / 恢复）→ 记录目标层数，**用裁剪后的 PMT 重握手**（保留最低的 N 层，重新取 token）；被砍掉的层再 `push` 会返回 `PPUSHER_E_LAYER_OFF`；`on_layers(first, count)` 回调告知新阶梯。5 秒防抖挡住的请求不会丢，防抖结束后自动重试。码率百分比对所有在线层生效（每层以自己的标称码率为基准） | `docs/design/publish-degrade-protocol.zh-CN.md` §7.1、ppobs `srt-degrade-client.cpp` |
 | `reconnect=true` | 立即关闭当前 SRT、重新取 token、重连（不累计退避，5 秒内最多触发一次）。**ppobs 目前未处理该标志**，靠 mmx 2 秒后掐连接兜底；ppusher 主动处理，中断更短 | `srt/conn.go::requestPublisherReconnect` |
 | `LOSS_SAMPLE` | 以 `retrans=0` 喂给本地丢包窗口（算法与 ppobs `publish-loss-reconnect.h` 逐行一致：周期聚合、热身一个窗口、默认 30s/300s/1.5%）；降级通道在线时用它，不在线才用本地 `srt_bistats`（发送端口径） | ppobs `srt-degrade-client.cpp::HandleLossSample` |
 | 退避 | 1s → 30s 指数退避，±20% 抖动，连接稳定 ≥ 30s 清零；降级 WS 自己 2s → 30s | 协议文档 §7.3 |
@@ -44,10 +47,11 @@
 
 - 每条 SRT 消息正好 **1316 字节**（7×188）；ppmmx 用 1316 的缓冲读，更大的会被截断。
 - 连接开头先发 PAT+PMT，之后每个关键帧前、以及 ≥500ms 无 PSI 时重发。
-- 视频 `0x1B`(H.264) / `0x24`(HEVC)，每连接只一种 codec，PES 无长度，关键帧置 RAI，每个视频 AU 带 PCR，AU 前补 AUD，关键帧缺参数集时用缓存的 SPS/PPS(/VPS) 补齐。
+- 视频 `0x1B`(H.264) / `0x24`(HEVC)，每连接只一种 codec，PES 无长度，关键帧置 RAI，AU 前补 AUD，关键帧缺参数集时用**该层**缓存的 SPS/PPS(/VPS) 补齐。同播时第 N 层的 PID 是 `0x100+N`，音频固定 `0x110`；**PCR 只放在第一条在线的视频层**上（每个 AU 带一个）；PAT/PMT 每个关键帧时刻只发一份（不是每层一份）。
 - Opus：`stream_type 0x06` + **registration(`Opus`) + extension(0x80, channel_config_code)** 两个描述符，PES 载荷带 `7F E0 <len>` 控制头，**PTS 必须等于 DTS**。
 - AAC：`0x0F` + ADTS，首个 PES 必须是完整 ADTS 帧（mmx 从里面取配置）。
 - 不支持 B 帧（`pts == dts`），请把编码器设为 B 帧数 0。
+- 同播时同一帧的各层依次 `push`，**最后一层**（`video_layers - 1`）结束时才冲刷 SRT 消息，其余层共用消息，避免每层一次填充浪费带宽。
 - 可选 `OBS-ABSTS-SEI-v1` 绝对时间戳（`enable_sei_timestamp`）：H.264 放在首个 VCL 之前，HEVC 用 suffix SEI。
 
 > **ppmmx 的发布白名单要求流名形如 `<table>-<view>`**（两段，字符集 `[A-Za-z0-9_-]`，各 ≤64），例如 `B01-frontView`。名字不匹配会在 SRT 连上后被 `'…' not configured caused publish refusal!` 拒绝，表现为“连上又断”。
@@ -134,7 +138,7 @@ ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency
 | `--ppcenter URL` | 默认 `https://api.pp-cdn.org` |
 | `--secret-env VAR` / `--secret-file F` | appSecret 来源（默认环境变量 `PPUSHER_APP_SECRET`） |
 | `--input ts:-` / `ts:udp://0.0.0.0:5000` / `ts:FILE` | 输入；文件默认按时间戳实时节奏发送，`--loop` 循环 |
-| `--bitrate-kbps N` | 标称码率，用于打印降级目标 |
+| `--bitrate-kbps A[,B,..]` | 每层标称码率（第 0 层在前），用于打印降级目标 |
 | `--no-degrade` / `--no-codec-path` / `--sei` | 关闭降级通道 / 不加 codec 后缀（pplayer 无法播放）/ 注入 SEI 时间戳 |
 | `--passphrase P` `--latency MS` | SRT 加密、延迟 |
 | `--ca-file F` `--insecure` | TLS CA 文件 / 跳过证书校验（仅测试） |
@@ -142,6 +146,15 @@ ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency
 | `--dry-run FILE` | 不联网，只把复用结果写成 TS 文件，用于核对 PAT/PMT |
 
 输入要求：H.264/HEVC + Opus 或 AAC，**无 B 帧**。输入含 B 帧时 CLI 会警告并改用 DTS。
+
+**同播输入**：TS 里有几条同 codec 的视频 elementary stream 就推几层（H.264 最多 4、HEVC 最多 3，多出的忽略并警告），PMT 顺序即层顺序、第一条应是最高画质。例如用 ffmpeg 生成 3 层：
+
+```bash
+ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
+       -filter_complex "[0:v]split=3[a][b][c];[b]scale=960:540[b2];[c]scale=640:360[c2]" \
+       -map "[a]" -map "[b2]" -map "[c2]" -map 1:a -c:v libx264 -bf 0 -g 60 -pix_fmt yuv420p -c:a libopus -f mpegts - \
+  | ppusher-cli --app-id <appId> --stream B01-frontView --bitrate-kbps 3000,1500,600 --ca-file ...
+```
 
 ---
 
@@ -152,8 +165,9 @@ ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency
 ```c
 #include <ppusher/ppusher.h>
 
-static void set_bitrate(int kbps, void *ud)  { encoder_set_bitrate(kbps); }   /* 不要重启编码器 */
-static void want_idr(void *ud)               { encoder_request_idr(); }
+static void set_bitrate(int layer, int kbps, void *ud) { encoder_set_bitrate(layer, kbps); } /* 不要重启编码器 */
+static void want_idr(void *ud)                         { for (int l = 0; l < 3; l++) encoder_request_idr(l); }
+static void on_layers(int first, int count, void *ud)  { /* first > 0：低于 first 的层被降级砍掉，可停掉其编码器 */ }
 
 ppusher_config_t cfg;
 ppusher_config_default(&cfg);                 /* 必须先取默认值，再覆盖 */
@@ -164,15 +178,19 @@ cfg.stream_name       = "B01-frontView";
 cfg.video_codec       = PPUSHER_CODEC_H264;   /* 或 HEVC；决定 path 后缀和 PMT */
 cfg.audio_codec       = PPUSHER_AUDIO_OPUS;   /* 或 AAC / NONE */
 cfg.audio_channels    = 2;
-cfg.video_bitrate_kbps= 2500;                 /* set_bitrate() 收到的是它 × bitrate_percent */
+cfg.video_layers      = 3;                    /* 同播层数：H.264 1..4，HEVC 1..3；0/1 = 单层 */
+cfg.video_bitrate_kbps[0] = 3000;             /* 每层的标称码率（第 0 层 = 最高画质） */
+cfg.video_bitrate_kbps[1] = 1500;
+cfg.video_bitrate_kbps[2] = 600;                /* set_bitrate() 收到的是它 × bitrate_percent */
 cfg.ca_file           = "/etc/ssl/certs/ca-certificates.crt";
 
-ppusher_callbacks_t cb = { .set_bitrate = set_bitrate, .request_keyframe = want_idr };
+ppusher_callbacks_t cb = { .set_bitrate = set_bitrate, .on_layers = on_layers, .request_keyframe = want_idr };
 ppusher_t *p = ppusher_create(&cfg, &cb);
 ppusher_start(p);                             /* 立即返回，库自己的线程负责联网/重连 */
 
 /* 编码线程里：未连上时返回 PPUSHER_E_NOT_CONNECTED，直接丢帧即可，不用缓存 */
-ppusher_push_video(p, annexb_au, len, pts_us, pts_us, is_idr);   /* pts == dts，微秒 */
+for (int l = 0; l < 3; l++)                   /* 同一帧的各层依次推，pts 相同；单层时 layer 恒为 0 */
+    ppusher_push_video(p, l, annexb_au[l], len[l], pts_us, pts_us, is_idr[l]);   /* pts == dts，微秒 */
 ppusher_push_audio(p, opus_packet, len, pts_us);
 
 ppusher_stop(p);  ppusher_destroy(p);
@@ -180,6 +198,7 @@ ppusher_stop(p);  ppusher_destroy(p);
 
 要点：
 
+- 同播：每层一路独立编码器（独立 SPS/PPS、独立 IDR，**各层 IDR 尽量对齐**），`request_keyframe` 回调对所有在线层都要出 IDR。被降级砍掉的层 `push` 返回 `PPUSHER_E_LAYER_OFF`，直接丢弃即可。
 - `push_*` 线程安全、非阻塞。每次（重）连上后库会回调 `request_keyframe`，并在拿到第一个 IDR 之前丢弃非关键帧，所以服务端看到的首个视频 AU 一定是 IDR。
 - 发送队列超过 75% 时库会主动丢非关键帧并请求 IDR，不会让延迟无限增长。
 - 状态：`on_state` 回调 / `ppusher_get_stats()`（`FETCHING → CONNECTING → STREAMING → BACKOFF …`，`FATAL` 表示凭据被拒）。
@@ -192,7 +211,8 @@ ppusher_stop(p);  ppusher_destroy(p);
 |---|---|---|
 | `ppcenter_url` `app_id` `app_secret` `stream_name` `region` | – | 鉴权与选路 |
 | `video_codec` `audio_codec` `audio_channels` `audio_sample_rate` | H264 / Opus / 2 / 48000 | 媒体；Opus 仅支持 1/2 声道；`audio_sample_rate` 只用于 AAC 的 ADTS 头 |
-| `video_bitrate_kbps` | 0 | 标称码率，0 则不回调 `set_bitrate` |
+| `video_layers` | 1 | 同播层数：H.264 1–4，HEVC 1–3；超限 `ppusher_create` 返回 NULL；0 视为 1 |
+| `video_bitrate_kbps[4]` | 0 | 每层标称码率（kbps），0 则该层不回调 `set_bitrate` |
 | `codec_path` | 1 | 1 = 发布到 `<stream>/h264|hevc`（推荐）；0 = 裸 path |
 | `enable_degrade` | 1 | 连接 ppmmx 降级 WebSocket |
 | `enable_sei_timestamp` | 0 | 每个视频 AU 注入 UTC 毫秒 SEI（端到端延迟测量） |
@@ -232,18 +252,19 @@ ctest --test-dir build --output-on-failure
 | `test_streamid` | streamid/token 拼装（codec 后缀、`:` `,` 空白、512 字节上限）、流名校验、日志打码、端点解析 |
 | `test_degrade` | `TARGET_STATE`（含 `reconnect`/`reason`、老格式、越界值）、`LOSS_SAMPLE`、`ALERT`（含中文与 `\u` 转义）、畸形输入、WS URL 推导、幂等跟踪 |
 | `test_loss_sm` | 丢包窗口（热身、周期聚合、重传抵扣、滑窗、复位）、退避、重连状态机（401 致命、402 慢重试、503 退避、`reconnect` 立即重取 token、5s 防抖、30s 稳定清零） |
-| `test_ts` | TS 复用关键字段：PAT/PMT/CRC、Opus 双描述符与 channel code、PES 头（PTS/DTS、33 位回绕）、PCR/RAI、AUD、参数集补齐、Opus 控制头长度编码、ADTS、SEI（含防竞争字节）、1316 对齐与 CC 连续 |
+| `test_ts` | TS 复用关键字段（含同播：1–4 层 PMT 顺序与 PID、PCR 只在第一条在线层、裁剪后的阶梯、每层独立 CC 与参数集缓存、冲刷规则、层数上限）：PAT/PMT/CRC、Opus 双描述符与 channel code、PES 头（PTS/DTS、33 位回绕）、PCR/RAI、AUD、参数集补齐、Opus 控制头长度编码、ADTS、SEI（含防竞争字节）、1316 对齐与 CC 连续 |
 | `test_net` | SHA-1/Base64/RFC 6455 示例、URL、chunked、ppcenter 请求/响应解析、HTTP 错误分类、超时、重定向、WebSocket（分片、ping/pong、掩码、16 位长度、close、坏握手） |
-| `test_session` | 真实 libsrt 监听器 + 模拟 ppcenter + 模拟降级 WS：每次重连 token 不同、`reconnect` 标志、延迟提示在新握手生效、断线重连、401 不重试、503 退避后恢复、`LOSS_SAMPLE` 触发重连 |
-| `interop_mediacommon` | 用 ppmmx SRT 摄取所用的 `mediacommon` MPEG-TS 解析器读取复用产物（需要 Go） |
-| `tests/e2e/run_local_e2e.sh` | **本地真实 ppmmx**（源码构建）+ 模拟 ppcenter 的端到端：token 校验、codec path 校验、降级 WS 鉴权、服务端重启后取新 token 恢复、错误凭据 FATAL。H.264+Opus 与 HEVC+AAC 均通过 |
+| `test_session` | 真实 libsrt 监听器 + 模拟 ppcenter + 模拟降级 WS：每次重连 token 不同、`reconnect` 标志、延迟提示在新握手生效、断线重连、401 不重试、503 退避后恢复、`LOSS_SAMPLE` 触发重连；**同播降级**：3 层 → `layers=2` 后用只含最低两层的 PMT 重握手（PCR 随之移动、新 token、被砍层返回 `LAYER_OFF`）→ 5 秒防抖后恢复 3 层，每层码率回调 |
+| `interop_mediacommon` | 用 ppmmx SRT 摄取所用的 `mediacommon` MPEG-TS 解析器读取复用产物：单层 H.264/HEVC、**4 层 H.264、3 层 HEVC**（需要 Go） |
+| `tests/e2e/run_local_e2e.sh` | **本地真实 ppmmx**（源码构建）+ 模拟 ppcenter 的端到端：token 校验、codec path 校验、降级 WS 鉴权、服务端重启后取新 token 恢复、错误凭据 FATAL。H.264+Opus、HEVC+AAC、**4 层 H.264 同播、3 层 HEVC 同播**均通过（ppmmx 日志确认 `treating them as a simulcast ladder`、`max layers set to N`） |
 
 已验证 / 未验证（诚实说明）：
 
 - ✅ 在 Windows + MinGW-w64 gcc 14 + libsrt 1.5.4 + OpenSSL 3.4 上全部通过，包括对本仓库同级 `ppmmx` 当前源码的本地端到端。
 - ✅ 对 `api.pp-cdn.org:443` 做了仅 TLS 握手的探测（不发 HTTP 请求）：带 CA 文件时证书链与主机名校验通过，无 CA 时按预期拒绝。
 - ⏳ **未验证**：Linux x86_64 / ARM / MIPS 上的编译与运行（开发机没有 Linux 编译器）；对**生产** ppcenter / ppmmx / `pplayer.pp-cdn.org` 的真实推流（需要测试账号，见下）。
-- ⏳ 降级的“阶梯”行为（真实丢包下 mmx 逐级降码率）没有在真实网络损伤下复现，目前覆盖的是协议解析、`set_bitrate` 回调、`reconnect`、`LOSS_SAMPLE` 触发重连。
+- ⏳ 降级的“阶梯”行为（真实丢包下 mmx 逐级降码率、砍层）没有在真实网络损伤下复现，目前覆盖的是协议解析、`set_bitrate` 回调、`reconnect`、`LOSS_SAMPLE` 触发重连，以及用模拟的 `TARGET_STATE.layers` 驱动的砍层/恢复重握手。
+- ⏳ 同播尚未对**生产** ppcenter/ppmmx 推过（生产 Origin 的节点是否放开 ≥2 层，ppmmx 源码里是允许的，但没有实测）。
 
 联调生产环境：需要一个**测试账号**（appId、appSecret、一个符合 `<table>-<view>` 的流名）。建议通过环境变量传入，不写入文件；联调只发布一路测试流，不做任何写配置的操作。
 
@@ -282,7 +303,7 @@ ctest --test-dir build --output-on-failure
 
 ## 9. 已知限制
 
-- 只支持单路视频（单 codec、单层）；HEVC+H.264 同播请起两个实例（两个 path 本来就是两个独立连接）。
+- 同播是“**单 codec 多层**”（H.264 ≤ 4 层 / HEVC ≤ 3 层，ppmmx 的限制）；**HEVC+H.264 双 codec 同播**要起两个 `ppusher` 实例（两个 path、两条 SRT 连接本来就是独立的），各自带自己的层数。
 - 不支持 B 帧；不支持 AV1。
 - `ppusher-cli` 只读 MPEG-TS 输入；裸 ES 输入没有实现（库 API 本身就是 ES 级的）。
 - 不支持 HTTP 代理，不跟随 ppcenter 的 3xx。

@@ -4,14 +4,21 @@
 #
 #   MMX=/path/to/mmx CLI=/path/to/ppusher-cli INPUT=/path/to/h264_opus.ts tests/e2e/run_local_e2e.sh
 #
-# Optional: MOCKCENTER=/path/to/prebuilt/mockcenter (default: go run), CODEC=h264|hevc (path suffix expected).
+# Optional: MOCKCENTER=/path/to/prebuilt/mockcenter (default: go run), CODEC=h264|hevc (path suffix expected),
+# LAYERS=N (simulcast ladder size of INPUT, default 1; see the ffmpeg recipe below).
 # The input must be MPEG-TS with H.264 (or HEVC) and Opus/AAC, B-frames off, e.g.
 #   ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i sine=frequency=440 -t 8 \
 #          -c:v libx264 -bf 0 -g 30 -pix_fmt yuv420p -c:a libopus -f mpegts h264_opus.ts
+# Simulcast input (3 layers, highest first; PMT order = layer order):
+#   ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 -t 8 \
+#          -filter_complex "[0:v]split=3[a][b][c];[b]scale=960:540[b2];[c]scale=640:360[c2]" \
+#          -map "[a]" -map "[b2]" -map "[c2]" -map 1:a -c:v libx264 -bf 0 -g 30 -pix_fmt yuv420p \
+#          -c:a libopus -f mpegts h264_x3_opus.ts     # then LAYERS=3
 set -u
 : "${MMX:?set MMX to a ppmmx binary}" "${CLI:?set CLI to ppusher-cli}" "${INPUT:?set INPUT to a .ts file}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEC="${CODEC:-h264}"
+LAYERS="${LAYERS:-1}"
 # native Windows binaries (MSYS2/Git Bash) cannot open /c/... style paths
 if command -v cygpath >/dev/null 2>&1; then INPUT="$(cygpath -m "$INPUT")"; fi
 WORK="$(mktemp -d)"
@@ -63,14 +70,17 @@ start_mmx
 
 echo "== ppusher-cli -> mock ppcenter -> ppmmx"
 PPUSHER_APP_SECRET="$SECRET" "$CLI" --app-id appx --stream "$STREAM" --ppcenter http://127.0.0.1:18000 \
-  --input "ts:$INPUT" --loop --bitrate-kbps 1500 > cli.log 2>&1 &
+  --input "ts:$INPUT" --loop --bitrate-kbps 3000,1500,800,400 > cli.log 2>&1 &
 PIDS+=($!)
 
 P="appx/$STREAM/$CODEC"
 check "publish accepted on the codec path ($P)" wait_for 30 mmx.log "is publishing to path '$P'"
-check "ppmmx decoded video+audio tracks" wait_for 5 mmx.log "stream is available and online, 2 tracks"
+check "ppmmx decoded video+audio tracks" wait_for 5 mmx.log "stream is available and online, $((LAYERS + 1)) tracks"
+if [ "$LAYERS" -gt 1 ]; then
+  check "ppmmx treats the $LAYERS video tracks as a simulcast ladder" wait_for 5 mmx.log "SRT publish contains $LAYERS"
+fi
 check "degrade WebSocket authenticated with the whipTracks bearer" wait_for 10 mmx.log "[degrade] path=$P executor client=ppusher"
-check "ppmmx learned the layer count from the SRT session" wait_for 10 mmx.log "[degrade] path=$P max layers set to 1"
+check "ppmmx learned the layer count from the SRT session" wait_for 10 mmx.log "[degrade] path=$P max layers set to $LAYERS"
 sleep 8
 check "no decode errors on the ppmmx side" bash -c "! grep -q 'decode error' mmx.log"
 check "ingest loss stays at zero on loopback" wait_for 10 mmx.log "unrecoverableLoss=0(0.00%)"
