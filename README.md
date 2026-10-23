@@ -2,7 +2,7 @@
 
 C/C++ publisher for embedded applications.
 
-**libppusher** publishes H.264/HEVC + Opus/AAC from a hardware encoder to [PPCDN](https://pp-cdn.org) over SRT:
+**libppusher** publishes H.264/HEVC + Opus from a hardware encoder (audio must be Opus: ppmmx rejects AAC and any other audio on SRT) to [PPCDN](https://pp-cdn.org) over SRT:
 lightweight MPEG-TS muxer, ppcenter token exchange (fresh token on every reconnect), ppmmx degrade/loss control
 channel (bitrate steps, `reconnect`, `LOSS_SAMPLE`) and a reconnect state machine. Pure C99; depends only on
 libsrt (+ optional OpenSSL for HTTPS/wss). MIT licensed.

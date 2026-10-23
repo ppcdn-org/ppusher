@@ -2,7 +2,7 @@
 
 面向嵌入式 Linux（ARM / MIPS 推流盒、摄像头、编码器板卡）的 **PPCDN SRT 推流库**，纯 C99，依赖只有 libsrt（外加可选的 OpenSSL，用于 HTTPS/wss）。
 
-硬件编码器把 **H.264 / HEVC 的 Annex-B 码流**和 **Opus（或 AAC）音频帧**推进来，库内完成：
+硬件编码器把 **H.264 / HEVC 的 Annex-B 码流**和 **Opus 音频帧**推进来（SRT 推流的音频必须是 Opus：ppmmx 会明确拒绝 AAC 等其它音频，因为节点间转发走 WHIP、WebRTC 不承载 AAC），库内完成：
 
 - 轻量 MPEG-TS 复用（与 ppmmx 的 SRT 摄取校验兼容），经 libsrt 发往 PPCDN Origin；
 - **SRT 同播（simulcast）**：同一条 SRT 连接里发多层视频，**H.264 最多 4 层、HEVC 最多 3 层**（ppmmx 的上限），降级时按 ppmmx 的 `TARGET_STATE.layers` 砍最高层并重握手；
@@ -145,7 +145,7 @@ ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency
 | `--direct HOST:PORT [--direct-token T] [--direct-ws URL --direct-ws-token T]` | 跳过 ppcenter，直连自建 ppmmx |
 | `--dry-run FILE` | 不联网，只把复用结果写成 TS 文件，用于核对 PAT/PMT |
 
-输入要求：H.264/HEVC + Opus 或 AAC，**无 B 帧**。输入含 B 帧时 CLI 会警告并改用 DTS。
+输入要求：H.264/HEVC + Opus，**无 B 帧**；音频不是 Opus（如 AAC）的推流会被 ppmmx 拒绝，请先转成 Opus。输入含 B 帧时 CLI 会警告并改用 DTS。
 
 **同播输入**：TS 里有几条同 codec 的视频 elementary stream 就推几层（H.264 最多 4、HEVC 最多 3，多出的忽略并警告），PMT 顺序即层顺序、第一条应是最高画质。例如用 ffmpeg 生成 3 层：
 
@@ -176,7 +176,7 @@ cfg.app_id            = "appxxxxxxxx";
 cfg.app_secret        = secret;               /* 库内拷贝；日志不打印 */
 cfg.stream_name       = "B01-frontView";
 cfg.video_codec       = PPUSHER_CODEC_H264;   /* 或 HEVC；决定 path 后缀和 PMT */
-cfg.audio_codec       = PPUSHER_AUDIO_OPUS;   /* 或 AAC / NONE */
+cfg.audio_codec       = PPUSHER_AUDIO_OPUS;   /* 或 NONE；AAC 会被 ppmmx 拒绝 */
 cfg.audio_channels    = 2;
 cfg.video_layers      = 3;                    /* 同播层数：H.264 1..4，HEVC 1..3；0/1 = 单层 */
 cfg.video_bitrate_kbps[0] = 3000;             /* 每层的标称码率（第 0 层 = 最高画质） */
