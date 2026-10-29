@@ -1,5 +1,20 @@
 # ppusher
 
+> **PPCDN** 是一个开源社区项目：<https://www.pp-cdn.org>
+>
+> PPCDN 为您带来 30%~50% 的带宽 & 成本节约，端到端极致低时延（<500ms）体验：
+>
+> 1. 支持多推流协议（ERTMP/SRT/WHIP）适应不同直播现场网络，并带来极致低时延体验（含播放缓冲时延）：
+>    P2P 直连时延：<120ms；WHIP 推流时延：<200ms；ERTMP 推流时延：<200ms；SRT 推流时延：<500ms。
+> 2. 兼容多种技术带来 30%~50% 的流量 & 成本下降：支持 HEVC 同播、内嵌 P2P 穿透服务、0 网络转码技术。
+> 3. 支持 ABR 自适应用户端网络，播放更流畅。
+> 4. 提供 API 获取当前播放帧时间戳，可用于游戏结果与音视频流的同步。
+>
+> PPCDN 跟腾讯云直播相比的优势：时延缩短 1s；0 转码费用；可读取实时时间戳；不同 quality 流切换无黑屏停顿。
+>
+> 官方在线 demo：<https://pplayer.pp-cdn.org/>
+> 请先下载 [ppobs v32.1.2rc008](https://github.com/ppcdn-org/ppobs/releases/tag/v32.1.2rc008) 推流后才能观看。
+
 面向嵌入式 Linux（ARM / MIPS 推流盒、摄像头、编码器板卡）的 **PPCDN SRT 推流库**，纯 C99，依赖只有 libsrt（外加可选的 OpenSSL，用于 HTTPS/wss）。
 
 硬件编码器把 **H.264 / HEVC 的 Annex-B 码流**和 **Opus 音频帧**推进来（SRT 推流的音频必须是 Opus：ppmmx 会明确拒绝 AAC 等其它音频，因为节点间转发走 WHIP、WebRTC 不承载 AAC），库内完成：
